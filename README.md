@@ -1,5 +1,11 @@
 # USB2XB
 
+<div align=center>
+
+<img src="https://github.com/Darkone83/USB2XB/blob/main/images/Logo.png" width=375> <img src="https://github.com/Darkone83/USB2XB/blob/main/images/Darkone83.png" width=375>
+
+</div>
+
 USB2XB is a dual-pane file manager for the Original Xbox designed to move files directly between the Xbox and standard **FAT32 USB mass-storage devices** connected through a controller-port USB adapter.
 
 It is intended to make simple USB ↔ Xbox file transfers possible without FTP, a network connection, or a PC-side Xbox filesystem tool.
