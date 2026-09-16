@@ -2,7 +2,7 @@
 
 <div align=center>
 
-<img src="https://github.com/Darkone83/USB2XB/blob/main/images/Logo.png" width=450> <img src="https://github.com/Darkone83/USB2XB/blob/main/images/Darkone83.png" width=450>
+<img src="https://github.com/Darkone83/USB2XB/blob/main/images/Logo.png" width=375> <img src="https://github.com/Darkone83/USB2XB/blob/main/images/Darkone83.png" width=375>
 
 </div>
 
