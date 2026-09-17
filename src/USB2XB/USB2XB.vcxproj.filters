@@ -80,6 +80,15 @@
     <ClInclude Include="usb2xb_audio.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="dd_textviewer.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="dd_hexviewer.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="dd_checksum.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dd_copyjob.cpp">
@@ -131,6 +140,15 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="usb2xb_ftol.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="dd_textviewer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="dd_hexviewer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="dd_checksum.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

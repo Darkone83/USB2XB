@@ -21,6 +21,7 @@ extern "C" {
         char src[DD_PATH_MAX];
         char name[DD_NAME_MAX];
         int isDir;
+        DWORD sizeLo;   /* top-level file size; ignored for directories */
     } CopyJobItem;
 
     enum
@@ -62,6 +63,9 @@ extern "C" {
         current is the 1-based file ordinal being transferred.
     */
     void CopyJob_FileCounter(int* current, int* total);
+
+    /* Exact sum of source-file bytes once preparation has completed. */
+    ULONGLONG CopyJob_TotalBytes(void);
 
     void CopyJob_Progress(int* filesDone, int* filesSeen,
         char* curName, int cap,

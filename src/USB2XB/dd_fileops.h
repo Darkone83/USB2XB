@@ -15,6 +15,15 @@ typedef struct
     char  name[DD_NAME_MAX];
     DWORD sizeLo;
     int   isDir;
+
+    /*
+        Backend-native sortable last-write timestamp.
+
+        FATX stores the raw FILETIME value. FAT32 stores the packed
+        last-write date/time as (date << 16) | time. The values are only
+        compared within one pane/backend, so both preserve chronological order.
+    */
+    ULONGLONG sortTime;
 } DDDirEntry;
 
 typedef struct

@@ -58,6 +58,13 @@ typedef struct
     DWORD clusterBytes;
 
     DWORD nextFreeHint;
+
+    /* FAT32 FSInfo bookkeeping. */
+    DWORD fsInfoSector;
+    DWORD backupBootSector;
+    DWORD freeClusterCount;
+    int freeCountKnown;
+    int fsInfoDirty;
 } FatVolume;
 
 typedef struct
@@ -179,6 +186,53 @@ static void fat_put_le32(unsigned char* p, DWORD v)
     p[3] = (unsigned char)((v >> 24) & 0xFF);
 }
 
+
+static void fat_now_date_time(WORD* outDate, WORD* outTime)
+{
+    SYSTEMTIME st;
+    WORD year;
+    WORD month;
+    WORD day;
+    WORD hour;
+    WORD minute;
+    WORD second;
+
+    GetLocalTime(&st);
+
+    year = st.wYear;
+    month = st.wMonth;
+    day = st.wDay;
+    hour = st.wHour;
+    minute = st.wMinute;
+    second = st.wSecond;
+
+    /* FAT dates can represent 1980 through 2107. */
+    if (year < 1980) year = 1980;
+    if (year > 2107) year = 2107;
+
+    if (month < 1 || month > 12) month = 1;
+    if (day < 1 || day > 31) day = 1;
+    if (hour > 23) hour = 0;
+    if (minute > 59) minute = 0;
+    if (second > 59) second = 0;
+
+    if (outDate)
+    {
+        *outDate = (WORD)(
+            ((year - 1980) << 9) |
+            (month << 5) |
+            day);
+    }
+
+    if (outTime)
+    {
+        *outTime = (WORD)(
+            (hour << 11) |
+            (minute << 5) |
+            (second >> 1));
+    }
+}
+
 static int fat_power2(DWORD v)
 {
     return v && ((v & (v - 1)) == 0);
@@ -195,6 +249,20 @@ static void fat_zero(void* p, int n)
     for (i = 0; i < n; ++i)
         b[i] = 0;
 }
+
+static void fat_copy_bytes(void* dst, const void* src, DWORD bytes)
+{
+    DWORD i;
+    unsigned char* d = (unsigned char*)dst;
+    const unsigned char* p = (const unsigned char*)src;
+
+    if (!dst || !src)
+        return;
+
+    for (i = 0; i < bytes; ++i)
+        d[i] = p[i];
+}
+
 
 static int fat_slen(const char* s)
 {
@@ -255,9 +323,180 @@ static int fat_is_sep(char c)
 
 
 /*===========================================================================
-    Raw sector + volume mount
+    Raw sector + metadata cache + volume mount
 ===========================================================================*/
-static int fat_read_sector(DWORD lba, void* dst)
+#define FAT_META_CACHE_ENTRIES 32
+#define FAT_META_READAHEAD_SECTORS 4
+#define FAT_ZERO_BATCH_SECTORS 32
+
+typedef struct
+{
+    DWORD lba;
+    DWORD age;
+    int valid;
+    unsigned char* data;
+} FatMetaCacheEntry;
+
+static FatMetaCacheEntry g_metaCache[FAT_META_CACHE_ENTRIES];
+static unsigned char* g_metaCacheStorage = 0;
+static unsigned char* g_metaReadAheadStorage = 0;
+static DWORD g_metaCacheSectorSize = 0;
+static DWORD g_metaCacheClock = 1;
+
+
+static void fat_cache_discard(void)
+{
+    int i;
+
+    if (g_metaCacheStorage)
+    {
+        free(g_metaCacheStorage);
+        g_metaCacheStorage = 0;
+    }
+
+    if (g_metaReadAheadStorage)
+    {
+        free(g_metaReadAheadStorage);
+        g_metaReadAheadStorage = 0;
+    }
+
+    g_metaCacheSectorSize = 0;
+    g_metaCacheClock = 1;
+
+    for (i = 0; i < FAT_META_CACHE_ENTRIES; ++i)
+    {
+        g_metaCache[i].lba = 0;
+        g_metaCache[i].age = 0;
+        g_metaCache[i].valid = 0;
+        g_metaCache[i].data = 0;
+    }
+}
+
+
+static int fat_cache_prepare(void)
+{
+    DWORD bytes;
+    int i;
+
+    if (!g_fat.deviceSectorSize)
+        return 0;
+
+    if (g_metaCacheStorage &&
+        g_metaCacheSectorSize == g_fat.deviceSectorSize)
+    {
+        return 1;
+    }
+
+    fat_cache_discard();
+
+    bytes = g_fat.deviceSectorSize * FAT_META_CACHE_ENTRIES;
+    g_metaCacheStorage = (unsigned char*)malloc(bytes);
+
+    if (!g_metaCacheStorage)
+        return 0;
+
+    /*
+        Read-ahead is optional.  If this small helper allocation fails, keep
+        the normal metadata cache active and fall back to one-sector fills.
+    */
+    g_metaReadAheadStorage = (unsigned char*)malloc(
+        g_fat.deviceSectorSize * FAT_META_READAHEAD_SECTORS);
+
+    g_metaCacheSectorSize = g_fat.deviceSectorSize;
+
+    for (i = 0; i < FAT_META_CACHE_ENTRIES; ++i)
+    {
+        g_metaCache[i].data =
+            g_metaCacheStorage +
+            i * g_metaCacheSectorSize;
+    }
+
+    return 1;
+}
+
+
+static void fat_cache_touch(FatMetaCacheEntry* e)
+{
+    int i;
+
+    if (!e)
+        return;
+
+    ++g_metaCacheClock;
+
+    if (g_metaCacheClock == 0)
+    {
+        g_metaCacheClock = 1;
+
+        for (i = 0; i < FAT_META_CACHE_ENTRIES; ++i)
+            g_metaCache[i].age = g_metaCache[i].valid ? 1 : 0;
+    }
+
+    e->age = g_metaCacheClock;
+}
+
+
+static FatMetaCacheEntry* fat_cache_find(DWORD lba)
+{
+    int i;
+
+    for (i = 0; i < FAT_META_CACHE_ENTRIES; ++i)
+    {
+        if (g_metaCache[i].valid &&
+            g_metaCache[i].lba == lba)
+        {
+            return &g_metaCache[i];
+        }
+    }
+
+    return 0;
+}
+
+
+static FatMetaCacheEntry* fat_cache_victim(void)
+{
+    FatMetaCacheEntry* oldest = 0;
+    int i;
+
+    for (i = 0; i < FAT_META_CACHE_ENTRIES; ++i)
+    {
+        if (!g_metaCache[i].valid)
+            return &g_metaCache[i];
+
+        if (!oldest ||
+            g_metaCache[i].age < oldest->age)
+        {
+            oldest = &g_metaCache[i];
+        }
+    }
+
+    return oldest;
+}
+
+
+static void fat_cache_invalidate_range(
+    DWORD lba,
+    DWORD count)
+{
+    int i;
+
+    if (!count)
+        return;
+
+    for (i = 0; i < FAT_META_CACHE_ENTRIES; ++i)
+    {
+        if (g_metaCache[i].valid &&
+            g_metaCache[i].lba >= lba &&
+            g_metaCache[i].lba - lba < count)
+        {
+            g_metaCache[i].valid = 0;
+            g_metaCache[i].age = 0;
+        }
+    }
+}
+
+
+static int fat_raw_read_sector(DWORD lba, void* dst)
 {
     if (!dst || !g_fat.deviceSectorSize)
         return 0;
@@ -266,17 +505,160 @@ static int fat_read_sector(DWORD lba, void* dst)
 }
 
 
-static int fat_write_sector(DWORD lba, const void* src)
+static int fat_raw_write_sector(DWORD lba, const void* src)
 {
+    int ok;
+
     if (!src || !g_fat.deviceSectorSize)
         return 0;
 
-    return USB2XB_USB_WriteSectors(lba, 1, src);
+    ok = USB2XB_USB_WriteSectors(lba, 1, src);
+
+    if (ok)
+        fat_cache_invalidate_range(lba, 1);
+
+    return ok;
 }
 
 
 /*
-    Contiguous data-path helpers.  Metadata continues to use the single-sector
+    Metadata cache: 32 sectors, LRU replacement, write-through, 4-sector read-ahead.
+
+    Only FAT/directory/FSInfo traffic uses these wrappers. File payload data
+    keeps using the direct/batched path so large copies cannot evict useful
+    metadata and hotplug never has dirty metadata stranded in RAM.
+*/
+static int fat_read_sector(DWORD lba, void* dst)
+{
+    FatMetaCacheEntry* e;
+
+    if (!dst || !g_fat.deviceSectorSize)
+        return 0;
+
+    if (!fat_cache_prepare())
+        return fat_raw_read_sector(lba, dst);
+
+    e = fat_cache_find(lba);
+
+    if (e)
+    {
+        fat_cache_touch(e);
+        fat_copy_bytes(dst, e->data, g_fat.deviceSectorSize);
+        return 1;
+    }
+
+    /*
+        Metadata miss read-ahead.  Directory walks and FAT scans are strongly
+        sequential, so fetch a few adjacent sectors under one READ(10).  The
+        USB backend still emits the same proven 512-byte physical data URBs.
+
+        Keep the window deliberately small: it saves CBW/CSW round trips
+        without turning a random metadata lookup into a large speculative read.
+    */
+    if (g_metaReadAheadStorage &&
+        g_fat.mounted &&
+        lba >= g_fat.volumeLba &&
+        lba < g_fat.volumeLba + g_fat.totalSectors)
+    {
+        DWORD count = FAT_META_READAHEAD_SECTORS;
+        DWORD remain =
+            (g_fat.volumeLba + g_fat.totalSectors) - lba;
+        DWORD i;
+
+        if (count > remain)
+            count = remain;
+
+        if (count > 1 &&
+            USB2XB_USB_ReadSectors(
+                lba,
+                count,
+                g_metaReadAheadStorage))
+        {
+            for (i = 0; i < count; ++i)
+            {
+                FatMetaCacheEntry* fill =
+                    fat_cache_find(lba + i);
+
+                if (!fill)
+                    fill = fat_cache_victim();
+
+                if (!fill)
+                    break;
+
+                fat_copy_bytes(
+                    fill->data,
+                    g_metaReadAheadStorage +
+                    i * g_fat.deviceSectorSize,
+                    g_fat.deviceSectorSize);
+
+                fill->lba = lba + i;
+                fill->valid = 1;
+                fat_cache_touch(fill);
+            }
+
+            e = fat_cache_find(lba);
+
+            if (e)
+            {
+                fat_cache_touch(e);
+                fat_copy_bytes(
+                    dst,
+                    e->data,
+                    g_fat.deviceSectorSize);
+                return 1;
+            }
+        }
+    }
+
+    e = fat_cache_victim();
+
+    if (!e ||
+        !fat_raw_read_sector(lba, e->data))
+    {
+        return 0;
+    }
+
+    e->lba = lba;
+    e->valid = 1;
+    fat_cache_touch(e);
+
+    fat_copy_bytes(dst, e->data, g_fat.deviceSectorSize);
+    return 1;
+}
+
+static int fat_write_sector(DWORD lba, const void* src)
+{
+    FatMetaCacheEntry* e;
+
+    if (!src || !g_fat.deviceSectorSize)
+        return 0;
+
+    /* Write-through keeps existing FAT update ordering and hotplug safety. */
+    if (!fat_raw_write_sector(lba, src))
+        return 0;
+
+    if (!fat_cache_prepare())
+        return 1;
+
+    e = fat_cache_find(lba);
+
+    if (!e)
+        e = fat_cache_victim();
+
+    if (e)
+    {
+        fat_copy_bytes(e->data, src, g_fat.deviceSectorSize);
+        e->lba = lba;
+        e->valid = 1;
+        fat_cache_touch(e);
+    }
+
+    return 1;
+}
+
+
+/*
+    Contiguous data-path helpers. Metadata uses the cache-backed single-sector
     wrappers above, while file I/O can hand the USB layer an aligned run.
     The transport itself keeps each Xbox OHCI data URB at 512 bytes.
 */
@@ -291,15 +673,174 @@ static int fat_read_sectors(DWORD lba, DWORD count, void* dst)
 
 static int fat_write_sectors(DWORD lba, DWORD count, const void* src)
 {
+    int ok;
+
     if (!src || !count || !g_fat.deviceSectorSize)
         return 0;
 
-    return USB2XB_USB_WriteSectors(lba, count, src);
+    ok = USB2XB_USB_WriteSectors(lba, count, src);
+
+    if (ok)
+        fat_cache_invalidate_range(lba, count);
+
+    return ok;
+}
+
+
+static int fat_fsinfo_valid(const unsigned char* sec)
+{
+    if (!sec)
+        return 0;
+
+    return
+        fat_le32(sec + 0) == 0x41615252u &&
+        fat_le32(sec + 484) == 0x61417272u &&
+        fat_le32(sec + 508) == 0xAA550000u;
+}
+
+
+static void fat_load_fsinfo(void)
+{
+    unsigned char* sec;
+    DWORD freeCount;
+    DWORD nextFree;
+    DWORD maxCluster;
+
+    g_fat.freeCountKnown = 0;
+    g_fat.freeClusterCount = 0;
+    g_fat.fsInfoDirty = 0;
+
+    if (!g_fat.mounted ||
+        g_fat.fsInfoSector == 0xFFFFFFFFu)
+    {
+        return;
+    }
+
+    sec = (unsigned char*)malloc(g_fat.deviceSectorSize);
+
+    if (!sec)
+        return;
+
+    if (!fat_read_sector(
+        g_fat.volumeLba + g_fat.fsInfoSector,
+        sec) ||
+        !fat_fsinfo_valid(sec))
+    {
+        free(sec);
+        return;
+    }
+
+    freeCount = fat_le32(sec + 488);
+    nextFree = fat_le32(sec + 492);
+    maxCluster = g_fat.clusterCount + 1;
+
+    if (freeCount <= g_fat.clusterCount)
+    {
+        g_fat.freeClusterCount = freeCount;
+        g_fat.freeCountKnown = 1;
+    }
+
+    if (nextFree >= 2 && nextFree <= maxCluster)
+        g_fat.nextFreeHint = nextFree;
+
+    free(sec);
+}
+
+
+static int fat_flush_fsinfo(void)
+{
+    unsigned char* sec;
+    DWORD primaryLba;
+    DWORD nextFree;
+    int primaryWritten = 0;
+
+    if (!g_fat.mounted || !g_fat.fsInfoDirty)
+        return 1;
+
+    if (g_fat.fsInfoSector == 0xFFFFFFFFu)
+    {
+        g_fat.fsInfoDirty = 0;
+        return 1;
+    }
+
+    /* Never turn a physical disconnect into recovery traffic. */
+    if (USB2XB_USB_State() != U2X_USB_READY)
+        return 0;
+
+    sec = (unsigned char*)malloc(g_fat.deviceSectorSize);
+
+    if (!sec)
+        return 0;
+
+    primaryLba = g_fat.volumeLba + g_fat.fsInfoSector;
+
+    if (!fat_read_sector(primaryLba, sec) ||
+        !fat_fsinfo_valid(sec))
+    {
+        free(sec);
+        return 0;
+    }
+
+    fat_put_le32(
+        sec + 488,
+        g_fat.freeCountKnown ?
+        g_fat.freeClusterCount :
+        0xFFFFFFFFu);
+
+    nextFree = g_fat.nextFreeHint;
+    if (nextFree < 2 || nextFree > g_fat.clusterCount + 1)
+        nextFree = 0xFFFFFFFFu;
+
+    fat_put_le32(sec + 492, nextFree);
+
+    if (!fat_write_sector(primaryLba, sec))
+    {
+        free(sec);
+        return 0;
+    }
+
+    primaryWritten = 1;
+
+    /*
+        FAT32 normally mirrors FSInfo next to the backup boot sector.
+        Update it when that copy exists and has valid FSInfo signatures.
+        A bad/missing backup copy is non-fatal because FSInfo is advisory.
+    */
+    if (g_fat.backupBootSector != 0xFFFFFFFFu &&
+        g_fat.backupBootSector + g_fat.fsInfoSector <
+        g_fat.reservedSectors)
+    {
+        DWORD backupLba =
+            g_fat.volumeLba +
+            g_fat.backupBootSector +
+            g_fat.fsInfoSector;
+
+        if (fat_read_sector(backupLba, sec) &&
+            fat_fsinfo_valid(sec))
+        {
+            fat_put_le32(
+                sec + 488,
+                g_fat.freeCountKnown ?
+                g_fat.freeClusterCount :
+                0xFFFFFFFFu);
+            fat_put_le32(sec + 492, nextFree);
+            fat_write_sector(backupLba, sec);
+        }
+    }
+
+    free(sec);
+
+    if (primaryWritten)
+        g_fat.fsInfoDirty = 0;
+
+    return primaryWritten;
 }
 
 
 static void fat_unmount(void)
 {
+    /* Cache is write-through, so unmount only has to discard stale reads. */
+    fat_cache_discard();
     fat_zero(&g_fat, sizeof(g_fat));
 }
 
@@ -318,6 +859,8 @@ static int fat_mount(void)
     DWORD total;
     DWORD nonData;
     DWORD dataSectors;
+    DWORD fsInfoSector;
+    DWORD backupBootSector;
 
     if (g_usbUserUnmounted)
     {
@@ -384,6 +927,8 @@ static int fat_mount(void)
     total32 = fat_le32(boot + 32);
     fatSize = fat_le32(boot + 36);
     rootCluster = fat_le32(boot + 44);
+    fsInfoSector = fat_le16(boot + 48);
+    backupBootSector = fat_le16(boot + 50);
 
     free(boot);
 
@@ -432,6 +977,14 @@ static int fat_mount(void)
 
     g_fat.nextFreeHint = 2;
 
+    g_fat.fsInfoSector =
+        (fsInfoSector > 0 && fsInfoSector < reserved) ?
+        fsInfoSector : 0xFFFFFFFFu;
+
+    g_fat.backupBootSector =
+        (backupBootSector > 0 && backupBootSector < reserved) ?
+        backupBootSector : 0xFFFFFFFFu;
+
     if (g_fat.clusterCount < 1 ||
         g_fat.clusterBytes < g_fat.deviceSectorSize)
     {
@@ -440,6 +993,7 @@ static int fat_mount(void)
     }
 
     g_fat.mounted = 1;
+    fat_load_fsinfo();
     return 1;
 }
 
@@ -563,6 +1117,9 @@ static int fat_set_fat_value(
     DWORD fat;
     DWORD oldRaw;
     DWORD newRaw;
+    DWORD firstOldValue = 0;
+    DWORD newValue;
+    int haveFirstOldValue = 0;
 
     if (!g_fat.mounted ||
         cluster<2 ||
@@ -597,6 +1154,13 @@ static int fat_set_fat_value(
         }
 
         oldRaw = fat_le32(sec + off);
+
+        if (!haveFirstOldValue)
+        {
+            firstOldValue = oldRaw & 0x0FFFFFFFu;
+            haveFirstOldValue = 1;
+        }
+
         newRaw = (oldRaw & 0xF0000000u) |
             (value & 0x0FFFFFFFu);
 
@@ -610,6 +1174,33 @@ static int fat_set_fat_value(
     }
 
     free(sec);
+
+    newValue = value & 0x0FFFFFFFu;
+
+    if (haveFirstOldValue &&
+        ((firstOldValue == 0) != (newValue == 0)))
+    {
+        if (g_fat.freeCountKnown)
+        {
+            if (firstOldValue == 0 && newValue != 0)
+            {
+                if (g_fat.freeClusterCount > 0)
+                    --g_fat.freeClusterCount;
+                else
+                    g_fat.freeCountKnown = 0;
+            }
+            else if (firstOldValue != 0 && newValue == 0)
+            {
+                if (g_fat.freeClusterCount < g_fat.clusterCount)
+                    ++g_fat.freeClusterCount;
+                else
+                    g_fat.freeCountKnown = 0;
+            }
+        }
+
+        g_fat.fsInfoDirty = 1;
+    }
+
     return 1;
 }
 
@@ -618,7 +1209,9 @@ static int fat_zero_cluster(DWORD cluster)
 {
     unsigned char* zero;
     DWORD lba;
-    DWORD i;
+    DWORD batchSectors;
+    DWORD batchBytes;
+    DWORD done;
 
     if (cluster < 2)
         return 0;
@@ -628,26 +1221,46 @@ static int fat_zero_cluster(DWORD cluster)
     if (!lba)
         return 0;
 
-    zero = (unsigned char*)malloc(g_fat.deviceSectorSize);
+    batchSectors = g_fat.sectorsPerCluster;
+
+    if (batchSectors > FAT_ZERO_BATCH_SECTORS)
+        batchSectors = FAT_ZERO_BATCH_SECTORS;
+
+    if (!batchSectors)
+        return 0;
+
+    batchBytes = batchSectors * g_fat.deviceSectorSize;
+    zero = (unsigned char*)malloc(batchBytes);
 
     if (!zero)
         return 0;
 
-    fat_zero(zero, (int)g_fat.deviceSectorSize);
+    fat_zero(zero, (int)batchBytes);
 
-    for (i = 0; i < g_fat.sectorsPerCluster; ++i)
+    done = 0;
+
+    while (done < g_fat.sectorsPerCluster)
     {
-        if (!fat_write_sector(lba + i, zero))
+        DWORD count = g_fat.sectorsPerCluster - done;
+
+        if (count > batchSectors)
+            count = batchSectors;
+
+        if (!fat_write_sectors(
+            lba + done,
+            count,
+            zero))
         {
             free(zero);
             return 0;
         }
+
+        done += count;
     }
 
     free(zero);
     return 1;
 }
-
 
 static int fat_alloc_cluster(
     int zeroCluster,
@@ -1605,6 +2218,8 @@ static int fat_write_file_entry(
     unsigned char* sec;
     unsigned char* e;
     int i;
+    WORD fatDate;
+    WORD fatTime;
 
     if (!lba ||
         off + 32 > g_fat.deviceSectorSize ||
@@ -1633,13 +2248,13 @@ static int fat_write_file_entry(
 
     e[11] = FAT_ATTR_ARCHIVE;
 
-    /*
-        Minimal valid DOS timestamp: 1980-01-01 00:00.
-        FAT date = (year-1980)<<9 | month<<5 | day = 0x0021.
-    */
-    fat_put_le16(e + 16, 0x0021);
-    fat_put_le16(e + 18, 0x0021);
-    fat_put_le16(e + 24, 0x0021);
+    fat_now_date_time(&fatDate, &fatTime);
+
+    fat_put_le16(e + 14, fatTime); /* creation time */
+    fat_put_le16(e + 16, fatDate); /* creation date */
+    fat_put_le16(e + 18, fatDate); /* last access date */
+    fat_put_le16(e + 22, fatTime); /* last write time */
+    fat_put_le16(e + 24, fatDate); /* last write date */
 
     fat_put_le16(
         e + 20,
@@ -1672,6 +2287,8 @@ static int fat_write_directory_entry(
     unsigned char* sec;
     unsigned char* e;
     int i;
+    WORD fatDate;
+    WORD fatTime;
 
     if (!lba ||
         off + 32 > g_fat.deviceSectorSize ||
@@ -1701,10 +2318,13 @@ static int fat_write_directory_entry(
 
     e[11] = FAT_ATTR_DIRECTORY;
 
-    /* Minimal valid DOS date: 1980-01-01. */
-    fat_put_le16(e + 16, 0x0021);
-    fat_put_le16(e + 18, 0x0021);
-    fat_put_le16(e + 24, 0x0021);
+    fat_now_date_time(&fatDate, &fatTime);
+
+    fat_put_le16(e + 14, fatTime); /* creation time */
+    fat_put_le16(e + 16, fatDate); /* creation date */
+    fat_put_le16(e + 18, fatDate); /* last access date */
+    fat_put_le16(e + 22, fatTime); /* last write time */
+    fat_put_le16(e + 24, fatDate); /* last write date */
 
     fat_put_le16(
         e + 20,
@@ -1751,6 +2371,8 @@ static int fat_init_directory_cluster(
     unsigned char dot[11];
     unsigned char dotdot[11];
     unsigned char* e;
+    WORD fatDate;
+    WORD fatTime;
 
     /*
         FAT32 root is represented as parent cluster 0 in a child directory's
@@ -1772,6 +2394,7 @@ static int fat_init_directory_cluster(
 
     fat_make_dot_name(dot, 0);
     fat_make_dot_name(dotdot, 1);
+    fat_now_date_time(&fatDate, &fatTime);
 
     e = sec;
 
@@ -1782,9 +2405,11 @@ static int fat_init_directory_cluster(
     }
 
     e[11] = FAT_ATTR_DIRECTORY;
-    fat_put_le16(e + 16, 0x0021);
-    fat_put_le16(e + 18, 0x0021);
-    fat_put_le16(e + 24, 0x0021);
+    fat_put_le16(e + 14, fatTime);
+    fat_put_le16(e + 16, fatDate);
+    fat_put_le16(e + 18, fatDate);
+    fat_put_le16(e + 22, fatTime);
+    fat_put_le16(e + 24, fatDate);
     fat_put_le16(e + 20, (WORD)((cluster >> 16) & 0xFFFF));
     fat_put_le16(e + 26, (WORD)(cluster & 0xFFFF));
 
@@ -1797,9 +2422,11 @@ static int fat_init_directory_cluster(
     }
 
     e[11] = FAT_ATTR_DIRECTORY;
-    fat_put_le16(e + 16, 0x0021);
-    fat_put_le16(e + 18, 0x0021);
-    fat_put_le16(e + 24, 0x0021);
+    fat_put_le16(e + 14, fatTime);
+    fat_put_le16(e + 16, fatDate);
+    fat_put_le16(e + 18, fatDate);
+    fat_put_le16(e + 22, fatTime);
+    fat_put_le16(e + 24, fatDate);
     fat_put_le16(e + 20, (WORD)((parentCluster >> 16) & 0xFFFF));
     fat_put_le16(e + 26, (WORD)(parentCluster & 0xFFFF));
 
@@ -1987,6 +2614,148 @@ static int fat_short_exists(
         dirCluster,
         name11,
         0, 0, 0, 0, 0);
+}
+
+
+
+#define FAT_ALIAS_FAST_PROBES 64
+
+/*
+    Build the canonical pieces used by the VFAT hidden "~n" alias.
+    This mirrors fat_make_short_alias(), but lets the create planner prebuild
+    a small alias window and test it while it is already walking the directory.
+*/
+static void fat_alias_parts(
+    const char* leaf,
+    char* base,
+    int baseCap,
+    int* outBaseN,
+    char* ext,
+    int extCap,
+    int* outExtN)
+{
+    int baseN = 0;
+    int extN = 0;
+    int len;
+    int dot = -1;
+    int i;
+
+    if (base && baseCap > 0)
+        base[0] = 0;
+    if (ext && extCap > 0)
+        ext[0] = 0;
+    if (outBaseN)
+        *outBaseN = 0;
+    if (outExtN)
+        *outExtN = 0;
+
+    if (!leaf || !base || baseCap < 2 || !ext || extCap < 1)
+        return;
+
+    len = fat_slen(leaf);
+
+    for (i = len - 1; i >= 0; --i)
+    {
+        if (leaf[i] == '.')
+        {
+            dot = i;
+            break;
+        }
+    }
+
+    for (i = 0;
+        i < (dot > 0 ? dot : len) && baseN < baseCap - 1;
+        ++i)
+    {
+        int c = (unsigned char)leaf[i];
+        int sc;
+
+        if (c == ' ' || c == '.')
+            continue;
+
+        sc = fat_short_char(c);
+        base[baseN++] = (char)(sc ? sc : '_');
+    }
+
+    if (baseN == 0)
+        base[baseN++] = '_';
+
+    base[baseN] = 0;
+
+    if (dot > 0 && dot < len - 1)
+    {
+        for (i = dot + 1;
+            i < len && extN < extCap - 1;
+            ++i)
+        {
+            int c = (unsigned char)leaf[i];
+            int sc;
+
+            if (c == ' ' || c == '.')
+                continue;
+
+            sc = fat_short_char(c);
+            ext[extN++] = (char)(sc ? sc : '_');
+        }
+    }
+
+    ext[extN] = 0;
+
+    if (outBaseN)
+        *outBaseN = baseN;
+    if (outExtN)
+        *outExtN = extN;
+}
+
+
+static int fat_numbered_alias(
+    const char* base,
+    int baseN,
+    const char* ext,
+    int extN,
+    DWORD n,
+    unsigned char out11[11])
+{
+    char digits[8];
+    int dn = 0;
+    DWORD v = n;
+    int suffixLen;
+    int keep;
+    int at;
+    int i;
+
+    if (!base || baseN < 1 || !ext || !out11 || n < 1)
+        return 0;
+
+    while (v && dn < (int)sizeof(digits))
+    {
+        digits[dn++] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+
+    suffixLen = 1 + dn; /* '~' + digits */
+    keep = 8 - suffixLen;
+
+    if (keep < 1)
+        return 0;
+
+    for (i = 0; i < 11; ++i)
+        out11[i] = ' ';
+
+    at = 0;
+
+    for (i = 0; i < baseN && at < keep; ++i)
+        out11[at++] = (unsigned char)base[i];
+
+    out11[at++] = '~';
+
+    while (dn > 0 && at < 8)
+        out11[at++] = (unsigned char)digits[--dn];
+
+    for (i = 0; i < extN && i < 3; ++i)
+        out11[8 + i] = (unsigned char)ext[i];
+
+    return 1;
 }
 
 
@@ -2182,45 +2951,6 @@ static void fat_lfn_build_entry(
 
         fat_put_le16(out + pos[i], wc);
     }
-}
-
-
-static int fat_write_slot32(
-    const FatSlot* slot,
-    const unsigned char entry[32])
-{
-    unsigned char* sec;
-    int i;
-
-    if (!slot || !entry ||
-        !slot->lba ||
-        slot->off + 32 > g_fat.deviceSectorSize)
-    {
-        return 0;
-    }
-
-    sec = (unsigned char*)malloc(g_fat.deviceSectorSize);
-
-    if (!sec)
-        return 0;
-
-    if (!fat_read_sector(slot->lba, sec))
-    {
-        free(sec);
-        return 0;
-    }
-
-    for (i = 0; i < 32; ++i)
-        sec[slot->off + i] = entry[i];
-
-    if (!fat_write_sector(slot->lba, sec))
-    {
-        free(sec);
-        return 0;
-    }
-
-    free(sec);
-    return 1;
 }
 
 
@@ -2499,6 +3229,366 @@ static int fat_locate_name(
 }
 
 
+
+/*
+    Plan creation of a new directory entry in one directory walk.
+
+    The older create path independently walked the same directory to:
+      1) find a visible-name collision,
+      2) find an unused hidden 8.3 alias, and
+      3) find a contiguous run of free LFN/SFN slots.
+
+    Large directories made that repeated work dominate tiny-file copies.
+    This planner gathers all three facts together.  The 64 common "~n"
+    aliases are checked during the same pass; only unusually collision-heavy
+    directories fall back to the older exhaustive alias search.
+*/
+static int fat_plan_create_entry(
+    DWORD dirCluster,
+    const char* leaf,
+    FatLocatedEntry* outExisting,
+    unsigned char out11[11],
+    int* outNeedsLfn,
+    int* outLfnCount,
+    FatSlot* outSlots)
+{
+    unsigned char exact[11];
+    int exactPossible;
+    int exactTaken = 0;
+    char aliasBase[256];
+    char aliasExt[256];
+    int aliasBaseN = 0;
+    int aliasExtN = 0;
+    unsigned char aliases[FAT_ALIAS_FAST_PROBES][11];
+    unsigned char aliasUsed[FAT_ALIAS_FAST_PROBES];
+    int aliasCount = 0;
+    int maxLfnCount;
+    int maxNeeded;
+    int chosenNeedsLfn = 0;
+    int chosenLfnCount = 0;
+    int i;
+
+    DWORD cluster = dirCluster;
+    DWORD hops = 0;
+    int endSeen = 0;
+    int scanDone = 0;
+
+    FatSlot currentRun[FAT_LFN_MAX_ENTRIES + 1];
+    FatSlot bestRun[FAT_LFN_MAX_ENTRIES + 1];
+    int currentRunCount = 0;
+    int bestRunCount = 0;
+
+    FatDir lfnState;
+    FatSlot pending[FAT_LFN_MAX_ENTRIES];
+    int pendingCount = 0;
+    UCHAR pendingChecksum = 0;
+    int checksumValid = 0;
+
+    if (outExisting)
+        fat_zero(outExisting, sizeof(*outExisting));
+    if (outNeedsLfn)
+        *outNeedsLfn = 0;
+    if (outLfnCount)
+        *outLfnCount = 0;
+    if (outSlots)
+        fat_zero(outSlots,
+            sizeof(FatSlot) * (FAT_LFN_MAX_ENTRIES + 1));
+
+    if (dirCluster < 2 ||
+        !leaf || !leaf[0] ||
+        !outExisting || !out11 ||
+        !outNeedsLfn || !outLfnCount || !outSlots ||
+        !fat_leaf_valid(leaf))
+    {
+        return 0;
+    }
+
+    maxLfnCount = (fat_slen(leaf) + 12) / 13;
+    if (maxLfnCount < 1 || maxLfnCount > FAT_LFN_MAX_ENTRIES)
+        return 0;
+    maxNeeded = maxLfnCount + 1;
+
+    exactPossible = fat_make_short_name(leaf, exact);
+
+    fat_alias_parts(
+        leaf,
+        aliasBase,
+        sizeof(aliasBase),
+        &aliasBaseN,
+        aliasExt,
+        sizeof(aliasExt),
+        &aliasExtN);
+
+    fat_zero(aliasUsed, sizeof(aliasUsed));
+
+    for (i = 0; i < FAT_ALIAS_FAST_PROBES; ++i)
+    {
+        if (!fat_numbered_alias(
+            aliasBase,
+            aliasBaseN,
+            aliasExt,
+            aliasExtN,
+            (DWORD)(i + 1),
+            aliases[i]))
+        {
+            break;
+        }
+        ++aliasCount;
+    }
+
+    fat_zero(&lfnState, sizeof(lfnState));
+    fat_lfn_reset(&lfnState);
+    fat_zero(currentRun, sizeof(currentRun));
+    fat_zero(bestRun, sizeof(bestRun));
+
+    while (!scanDone)
+    {
+        DWORD base = fat_cluster_lba(cluster);
+        DWORD s;
+
+        if (!base)
+            return 0;
+
+        for (s = 0; s < g_fat.sectorsPerCluster && !scanDone; ++s)
+        {
+            unsigned char* sec;
+            DWORD entries;
+            DWORD ei;
+
+            sec = (unsigned char*)malloc(g_fat.deviceSectorSize);
+            if (!sec)
+                return 0;
+
+            if (!fat_read_sector(base + s, sec))
+            {
+                free(sec);
+                return 0;
+            }
+
+            entries = g_fat.deviceSectorSize / 32;
+
+            for (ei = 0; ei < entries; ++ei)
+            {
+                unsigned char* e = sec + ei * 32;
+                UCHAR first = e[0];
+                UCHAR attr = e[11];
+                int freeSlot = 0;
+
+                if (first == 0x00)
+                    endSeen = 1;
+
+                if (endSeen || first == 0xE5)
+                    freeSlot = 1;
+
+                if (freeSlot)
+                {
+                    if (currentRunCount < maxNeeded)
+                    {
+                        currentRun[currentRunCount].lba = base + s;
+                        currentRun[currentRunCount].off = ei * 32;
+                        ++currentRunCount;
+                    }
+
+                    if (currentRunCount > bestRunCount)
+                    {
+                        bestRunCount = currentRunCount;
+                        for (i = 0; i < bestRunCount; ++i)
+                            bestRun[i] = currentRun[i];
+                    }
+
+                    fat_lfn_reset(&lfnState);
+                    pendingCount = 0;
+                    checksumValid = 0;
+
+                    /* After 0x00 there can be no later live directory entry. */
+                    if (endSeen && bestRunCount >= maxNeeded)
+                    {
+                        scanDone = 1;
+                        break;
+                    }
+
+                    continue;
+                }
+
+                currentRunCount = 0;
+
+                if (attr == FAT_ATTR_LFN)
+                {
+                    int ord = e[0];
+
+                    if (ord & 0x40)
+                    {
+                        fat_lfn_reset(&lfnState);
+                        pendingCount = 0;
+                        pendingChecksum = e[13];
+                        checksumValid = 1;
+                    }
+                    else if (!checksumValid || pendingChecksum != e[13])
+                    {
+                        fat_lfn_reset(&lfnState);
+                        pendingCount = 0;
+                        checksumValid = 0;
+                    }
+
+                    if (pendingCount < FAT_LFN_MAX_ENTRIES)
+                    {
+                        pending[pendingCount].lba = base + s;
+                        pending[pendingCount].off = ei * 32;
+                        ++pendingCount;
+                    }
+
+                    fat_lfn_put(&lfnState, e);
+                    continue;
+                }
+
+                if (attr & FAT_ATTR_VOLUME)
+                {
+                    fat_lfn_reset(&lfnState);
+                    pendingCount = 0;
+                    checksumValid = 0;
+                    continue;
+                }
+
+                if (exactPossible && fat_short_equal(e, exact))
+                    exactTaken = 1;
+
+                for (i = 0; i < aliasCount; ++i)
+                {
+                    if (!aliasUsed[i] && fat_short_equal(e, aliases[i]))
+                    {
+                        aliasUsed[i] = 1;
+                        break;
+                    }
+                }
+
+                {
+                    char visible[DD_NAME_MAX];
+                    int validLfn =
+                        lfnState.lfnActive &&
+                        lfnState.lfn[0] &&
+                        checksumValid &&
+                        pendingChecksum == fat_lfn_checksum(e);
+
+                    if (validLfn)
+                        fat_scpy(visible, sizeof(visible), lfnState.lfn);
+                    else
+                        fat_short_name(e, visible, sizeof(visible));
+
+                    if (fat_nameeq(visible, leaf))
+                    {
+                        DWORD hi = fat_le16(e + 20);
+                        DWORD lo = fat_le16(e + 26);
+
+                        outExisting->found = 1;
+                        outExisting->shortSlot.lba = base + s;
+                        outExisting->shortSlot.off = ei * 32;
+                        outExisting->lfnCount = validLfn ? pendingCount : 0;
+
+                        for (i = 0; i < outExisting->lfnCount; ++i)
+                            outExisting->lfnSlots[i] = pending[i];
+
+                        for (i = 0; i < 11; ++i)
+                            outExisting->shortName[i] = e[i];
+
+                        outExisting->firstCluster = (hi << 16) | lo;
+                        outExisting->size = fat_le32(e + 28);
+                        outExisting->attr = attr;
+
+                        free(sec);
+                        return 1;
+                    }
+                }
+
+                fat_lfn_reset(&lfnState);
+                pendingCount = 0;
+                checksumValid = 0;
+            }
+
+            free(sec);
+        }
+
+        if (scanDone)
+            break;
+
+        {
+            DWORD next = fat_next_cluster(cluster);
+
+            if (!next)
+                break;
+
+            cluster = next;
+            ++hops;
+
+            if (hops > g_fat.clusterCount + 1)
+                return 0;
+        }
+    }
+
+    if (exactPossible && !exactTaken)
+    {
+        for (i = 0; i < 11; ++i)
+            out11[i] = exact[i];
+
+        chosenNeedsLfn =
+            fat_short_name_exact_text(leaf, exact) ? 0 : 1;
+    }
+    else
+    {
+        int chosen = -1;
+
+        for (i = 0; i < aliasCount; ++i)
+        {
+            if (!aliasUsed[i])
+            {
+                chosen = i;
+                break;
+            }
+        }
+
+        if (chosen >= 0)
+        {
+            for (i = 0; i < 11; ++i)
+                out11[i] = aliases[chosen][i];
+            chosenNeedsLfn = 1;
+        }
+        else
+        {
+            /* Very collision-heavy directory: preserve the exhaustive path. */
+            if (!fat_make_short_alias(
+                dirCluster,
+                leaf,
+                out11,
+                &chosenNeedsLfn))
+            {
+                return 0;
+            }
+        }
+    }
+
+    chosenLfnCount = chosenNeedsLfn ? maxLfnCount : 0;
+
+    {
+        int needed = chosenLfnCount + 1;
+
+        if (bestRunCount >= needed)
+        {
+            for (i = 0; i < needed; ++i)
+                outSlots[i] = bestRun[i];
+        }
+        else
+        {
+            /* Rare full/fragmented directory: let the proven extender handle it. */
+            if (!fat_reserve_slots(dirCluster, needed, outSlots))
+                return 0;
+        }
+    }
+
+    *outNeedsLfn = chosenNeedsLfn;
+    *outLfnCount = chosenLfnCount;
+    return 1;
+}
+
+
 static int fat_publish_named_entry(
     const FatSlot* lfnSlots,
     int lfnCount,
@@ -2521,20 +3611,57 @@ static int fat_publish_named_entry(
         if (!lfnSlots || !longName || !longName[0])
             return 0;
 
-        for (i = 0; i < lfnCount; ++i)
+        i = 0;
+
+        while (i < lfnCount)
         {
-            unsigned char e[32];
-            int seq = lfnCount - i;
+            unsigned char* sec;
+            DWORD lba = lfnSlots[i].lba;
+            int j = i;
 
-            fat_lfn_build_entry(
-                e,
-                longName,
-                seq,
-                lfnCount,
-                checksum);
+            sec = (unsigned char*)malloc(g_fat.deviceSectorSize);
 
-            if (!fat_write_slot32(&lfnSlots[i], e))
+            if (!sec)
                 return 0;
+
+            if (!fat_read_sector(lba, sec))
+            {
+                free(sec);
+                return 0;
+            }
+
+            /*
+                Consecutive LFN slots are normally in the same directory
+                sector. Patch every slot in that sector and issue one metadata
+                write instead of one WRITE(10) per 32-byte entry.
+            */
+            while (j < lfnCount && lfnSlots[j].lba == lba)
+            {
+                unsigned char e[32];
+                int seq = lfnCount - j;
+                int k;
+
+                fat_lfn_build_entry(
+                    e,
+                    longName,
+                    seq,
+                    lfnCount,
+                    checksum);
+
+                for (k = 0; k < 32; ++k)
+                    sec[lfnSlots[j].off + k] = e[k];
+
+                ++j;
+            }
+
+            if (!fat_write_sector(lba, sec))
+            {
+                free(sec);
+                return 0;
+            }
+
+            free(sec);
+            i = j;
         }
     }
 
@@ -2694,46 +3821,26 @@ static int usb_mkdir(
         return 0;
     }
 
-    if (fat_locate_name(
+    if (!fat_plan_create_entry(
         parentCluster,
         leaf,
-        &existing))
-    {
-        return (existing.attr & FAT_ATTR_DIRECTORY) ? 1 : 0;
-    }
-
-    if (!fat_make_short_alias(
-        parentCluster,
-        leaf,
+        &existing,
         name11,
-        &needsLfn))
-    {
-        return 0;
-    }
-
-    if (needsLfn)
-    {
-        lfnCount = (fat_slen(leaf) + 12) / 13;
-
-        if (lfnCount<1 ||
-            lfnCount>FAT_LFN_MAX_ENTRIES)
-        {
-            return 0;
-        }
-    }
-
-    if (!fat_reserve_slots(
-        parentCluster,
-        lfnCount + 1,
+        &needsLfn,
+        &lfnCount,
         slots))
     {
         return 0;
     }
 
+    if (existing.found)
+        return (existing.attr & FAT_ATTR_DIRECTORY) ? 1 : 0;
+
     if (!fat_alloc_cluster(
         1,
         &newCluster))
     {
+        fat_flush_fsinfo();
         return 0;
     }
 
@@ -2743,6 +3850,7 @@ static int usb_mkdir(
         0 : parentCluster))
     {
         fat_free_chain(newCluster);
+        fat_flush_fsinfo();
         return 0;
     }
 
@@ -2757,9 +3865,11 @@ static int usb_mkdir(
         0))
     {
         fat_free_chain(newCluster);
+        fat_flush_fsinfo();
         return 0;
     }
 
+    fat_flush_fsinfo();
     return 1;
 }
 
@@ -2874,6 +3984,7 @@ static int usb_rename(
         oldEntry.firstCluster,
         oldEntry.size))
     {
+        fat_flush_fsinfo();
         return 0;
     }
 
@@ -2891,9 +4002,11 @@ static int usb_rename(
             fat_delete_located(&rollback);
         }
 
+        fat_flush_fsinfo();
         return 0;
     }
 
+    fat_flush_fsinfo();
     return 1;
 }
 
@@ -2938,6 +4051,7 @@ static int usb_remove_file(
     if (loc.firstCluster >= 2)
         fat_free_chain(loc.firstCluster);
 
+    fat_flush_fsinfo();
     return 1;
 }
 
@@ -2986,6 +4100,7 @@ static int usb_remove_dir(
         return 0;
 
     fat_free_chain(loc.firstCluster);
+    fat_flush_fsinfo();
     return 1;
 }
 
@@ -3288,7 +4403,7 @@ static int usb_read(
         if (!f->sectorLoaded ||
             f->loadedLba != lba)
         {
-            if (!fat_read_sector(
+            if (!fat_raw_read_sector(
                 lba, f->sector))
             {
                 return 0;
@@ -3358,13 +4473,19 @@ static DDFileHandle usb_open_write(
         return 0;
     }
 
-    if (!fat_leaf_valid(leaf))
-        return 0;
-
-    if (fat_locate_name(
+    if (!fat_plan_create_entry(
         parentCluster,
         leaf,
-        &existing))
+        &existing,
+        name11,
+        &needsLfn,
+        &lfnCount,
+        slots))
+    {
+        return 0;
+    }
+
+    if (existing.found)
     {
         if (existing.attr & FAT_ATTR_DIRECTORY)
             return 0;
@@ -3374,36 +4495,6 @@ static DDFileHandle usb_open_write(
 
         for (i = 0; i < 11; ++i)
             name11[i] = existing.shortName[i];
-    }
-    else
-    {
-        if (!fat_make_short_alias(
-            parentCluster,
-            leaf,
-            name11,
-            &needsLfn))
-        {
-            return 0;
-        }
-
-        if (needsLfn)
-        {
-            lfnCount = (fat_slen(leaf) + 12) / 13;
-
-            if (lfnCount<1 ||
-                lfnCount>FAT_LFN_MAX_ENTRIES)
-            {
-                return 0;
-            }
-        }
-
-        if (!fat_reserve_slots(
-            parentCluster,
-            lfnCount + 1,
-            slots))
-        {
-            return 0;
-        }
     }
 
     f = (FatFile*)malloc(sizeof(FatFile));
@@ -3604,7 +4695,7 @@ static int usb_write(
         if (offInSector == 0 &&
             chunk == g_fat.deviceSectorSize)
         {
-            if (!fat_write_sector(
+            if (!fat_raw_write_sector(
                 lba,
                 in + total))
             {
@@ -3621,7 +4712,7 @@ static int usb_write(
                 on the next Fileops pump. Read/modify/write preserves bytes
                 already committed in that sector.
             */
-            if (!fat_read_sector(
+            if (!fat_raw_read_sector(
                 lba,
                 f->sector))
             {
@@ -3633,7 +4724,7 @@ static int usb_write(
                 f->sector[offInSector + i] =
                 in[total + i];
 
-            if (!fat_write_sector(
+            if (!fat_raw_write_sector(
                 lba,
                 f->sector))
             {
@@ -3712,6 +4803,12 @@ static void usb_close(
                 fat_free_chain(
                     f->startCluster);
         }
+
+        /*
+            Keep FAT32 FSInfo current once the complete file mutation has
+            committed (or its orphan chain has been reclaimed).
+        */
+        fat_flush_fsinfo();
     }
 
     if (f->sector)
@@ -3945,6 +5042,9 @@ int USB2XB_StorageFormatUsbBegin(void)
     fmt_reset();
 
     g_fmt.v = g_fat;
+
+    /* Formatting rewrites metadata/data wholesale; no cached read may survive. */
+    fat_cache_discard();
 
     if (g_fmt.v.deviceSectorSize != 512 ||
         g_fmt.v.fatCount < 1 ||
@@ -4184,6 +5284,43 @@ fail:
 /*===========================================================================
     Public setup
 ===========================================================================*/
+int USB2XB_StorageUsbSpace(ULONGLONG* freeBytes,
+    ULONGLONG* totalBytes,
+    int* freeKnown)
+{
+    ULONGLONG clusterBytes;
+
+    if (freeBytes)
+        *freeBytes = 0;
+    if (totalBytes)
+        *totalBytes = 0;
+    if (freeKnown)
+        *freeKnown = 0;
+
+    if (!fat_mount() || !g_fat.mounted)
+        return 0;
+
+    clusterBytes = (ULONGLONG)g_fat.clusterBytes;
+
+    if (totalBytes)
+        *totalBytes = (ULONGLONG)g_fat.clusterCount * clusterBytes;
+
+    /*
+        FAT32 FSInfo is advisory. USB2XB keeps a valid free count current after
+        its own mutations, but externally-created media may mark it unknown.
+        Do not turn a pane refresh into a multi-megabyte FAT scan in that case.
+    */
+    if (g_fat.freeCountKnown)
+    {
+        if (freeBytes)
+            *freeBytes = (ULONGLONG)g_fat.freeClusterCount * clusterBytes;
+        if (freeKnown)
+            *freeKnown = 1;
+    }
+
+    return 1;
+}
+
 void USB2XB_StorageInitUsb(DDStorage* s)
 {
     if (!s)
@@ -4226,6 +5363,7 @@ void USB2XB_StorageUsbUnmount(void)
         FileMan only exposes this while idle, so there should be no live FAT
         handles here.  Invalidate all cached BPB/FAT geometry immediately.
     */
+    fat_flush_fsinfo();
     g_usbUserUnmounted = 1;
     fat_unmount();
 }
@@ -4238,6 +5376,7 @@ void USB2XB_StorageUsbRemount(void)
         request a low-level rescan, but the storage layer itself never tears
         down or rewrites the validated USB transport state.
     */
+    fat_flush_fsinfo();
     g_usbUserUnmounted = 0;
     fat_unmount();
 }

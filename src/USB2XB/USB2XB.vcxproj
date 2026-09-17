@@ -14,11 +14,14 @@
     <Text Include="Media\Copy Assets Here.txt" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="dd_checksum.h" />
     <ClInclude Include="dd_copyjob.h" />
     <ClInclude Include="dd_fileops.h" />
     <ClInclude Include="dd_gfx.h" />
+    <ClInclude Include="dd_hexviewer.h" />
     <ClInclude Include="dd_iso.h" />
     <ClInclude Include="dd_osk.h" />
+    <ClInclude Include="dd_textviewer.h" />
     <ClInclude Include="dd_ui.h" />
     <ClInclude Include="fileman.h" />
     <ClInclude Include="font.h" />
@@ -35,11 +38,14 @@
     <ClInclude Include="xbox_usb.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="dd_checksum.cpp" />
     <ClCompile Include="dd_copyjob.cpp" />
     <ClCompile Include="dd_fileops.cpp" />
     <ClCompile Include="dd_gfx.cpp" />
+    <ClCompile Include="dd_hexviewer.cpp" />
     <ClCompile Include="dd_iso.cpp" />
     <ClCompile Include="dd_osk.cpp" />
+    <ClCompile Include="dd_textviewer.cpp" />
     <ClCompile Include="dd_ui.cpp" />
     <ClCompile Include="fileman.cpp" />
     <ClCompile Include="font.cpp" />

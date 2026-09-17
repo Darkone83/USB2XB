@@ -3,7 +3,7 @@
 
     Keeps the useful DarkDash FileMan model:
       - independent source/destination pane state
-      - directories first, alpha sort
+      - directories first, selectable name/size/date sort
       - marking
       - pane switching
       - directory navigation
@@ -21,6 +21,9 @@
 #include "font.h"
 #include "input.h"
 #include "dd_osk.h"
+#include "dd_textviewer.h"
+#include "dd_hexviewer.h"
+#include "dd_checksum.h"
 
 #include "usb2xb_usb.h"
 #include "usb2xb_storage.h"
@@ -45,7 +48,28 @@ extern "C"
 
     LONG WINAPI IoDeleteSymbolicLink(
         U2X_XBOX_STRING* SymbolicLinkName);
+
+    LONG WINAPI NtOpenSymbolicLinkObject(
+        HANDLE* LinkHandle,
+        void* ObjectAttributes);
+
+    LONG WINAPI NtQuerySymbolicLinkObject(
+        HANDLE LinkHandle,
+        U2X_XBOX_STRING* LinkTarget,
+        ULONG* ReturnedLength);
+
+    LONG WINAPI NtClose(HANDLE Handle);
 }
+
+/* Xbox OBJECT_ATTRIBUTES layout used by the object-manager calls below. */
+typedef struct _U2X_OBJECT_ATTRIBUTES
+{
+    HANDLE RootDirectory;
+    U2X_XBOX_STRING* ObjectName;
+    ULONG Attributes;
+} U2X_OBJECT_ATTRIBUTES;
+
+#define U2X_OBJ_CASE_INSENSITIVE 0x00000040UL
 
 typedef struct
 {
@@ -129,11 +153,13 @@ static void U2x_MountHddPartitions(void)
 #define FM_MARQUEE_STEP_MS    115
 #define FM_MARQUEE_HOLD_STEPS   7
 #define FM_MARQUEE_GAP           4
+#define FM_FILTER_MAX            64
 
 typedef struct
 {
     char name[FM_NAME_MAX];
     DWORD sizeLo;
+    ULONGLONG sortTime;
     int isDir;
     int isDrive;
     char devPath[8];
@@ -150,9 +176,27 @@ typedef struct
     int cursor;
     int scroll;
 
+    ULONGLONG freeBytes;
+    ULONGLONG totalBytes;
+    int spaceValid;
+    int freeKnown;
+
+    /* Current-directory, case-insensitive filename filter. */
+    char filter[FM_FILTER_MAX];
+
+    int sortMode;
+
     int marqueeCursor;
     DWORD marqueeStart;
 } Pane;
+
+enum
+{
+    FM_SORT_NAME = 0,
+    FM_SORT_SIZE,
+    FM_SORT_DATE,
+    FM_SORT_COUNT
+};
 
 static Pane s_pane[2];
 static int s_active = 0;
@@ -161,7 +205,7 @@ static int s_usbReadyLast = 0;
 static int s_usbRawReadyLast = 0;
 
 /* shared scratch; rendered immediately, so one buffer is enough */
-static char s_marqueeText[FM_NAME_MAX * 2 + FM_MARQUEE_GAP + 8];
+static char s_marqueeText[FM_PATH_MAX * 2 + FM_MARQUEE_GAP + 8];
 
 enum
 {
@@ -170,6 +214,7 @@ enum
     FM_DESTPICK,
     FM_OSK_MKDIR,
     FM_OSK_RENAME,
+    FM_OSK_FILTER,
     FM_CONFIRM_DELETE,
     FM_CONFIRM_FORMAT,
     FM_CONFIRM_EXIT,
@@ -194,39 +239,113 @@ static int s_pendDest = 1;
 static char s_renameOldPath[FM_PATH_MAX];
 static int s_renamePane = 0;
 
+/*
+    XBE launch state.
+
+    Internal FATX XBEs launch directly after remapping D: to their containing
+    directory. USB XBEs are staged inside USB2XB's own install directory at
+    D:\USB2XB_STAGE. Only that private folder is purged between launches.
+    At handoff D: is rebound to the staging folder's native device path.
+*/
+static int  s_launchStaging = 0;
+static char s_launchXbeName[FM_NAME_MAX];
+static char s_launchStageDir[FM_PATH_MAX];
+
+/*
+    Lazy XBE metadata cache used by the START details panel.  XBE metadata is
+    deliberately not read while simply browsing: on USB 1.1 even a tiny read
+    is visible latency, so we only parse the highlighted XBE when details are
+    actually open and then reuse the result until a pane reload/path change.
+*/
+typedef struct _U2X_XBE_INFO
+{
+    DDStorage* fs;
+    char path[FM_PATH_MAX];
+    int attempted;
+    int valid;
+
+    char title[81];
+    DWORD titleId;
+    DWORD region;
+    DWORD initFlags;
+    DWORD discNumber;
+    DWORD version;
+} U2X_XBE_INFO;
+
+static U2X_XBE_INFO s_xbeInfo;
+
+/* Copy preflight is evaluated once, after expand-once preparation completes. */
+static int s_copyPreflightChecked = 0;
+static int s_copyPreflightNoSpace = 0;
+
 static const char* kOpsUsb[] = {
     "New Folder",
     "Rename",
     "Delete",
+    "Hex Viewer",
+    "Checksums",
+    "Filter",
     "Rescan USB",
     "Unmount USB",
-    "Format USB"
+    "Format USB",
+    "Sort"
 };
 
 static const char* kOpsXbox[] = {
     "New Folder",
     "Rename",
-    "Delete"
+    "Delete",
+    "Hex Viewer",
+    "Checksums",
+    "Filter",
+    "Sort"
 };
+
+static const char* sort_mode_label(int mode)
+{
+    switch (mode)
+    {
+    case FM_SORT_SIZE:
+        return "Sort: Size";
+
+    case FM_SORT_DATE:
+        return "Sort: Date";
+
+    default:
+        return "Sort: Name";
+    }
+}
 
 static int ops_count(void)
 {
-    return s_active == 0 ? 6 : 3;
+    return s_active == 0 ? 10 : 7;
 }
 
 static const char* ops_label(int i)
 {
     if (s_active == 0)
     {
-        if (i == 4)
+        if (i == 7)
         {
             return USB2XB_StorageUsbUserUnmounted() ?
                 "Mount USB" :
                 "Unmount USB";
         }
 
+        if (i == 9)
+            return sort_mode_label(s_pane[0].sortMode);
+
+        if (i == 5 && s_pane[0].filter[0])
+            return "Filter: Active";
+
         return kOpsUsb[i];
     }
+
+    if (i == 6)
+        return sort_mode_label(s_pane[1].sortMode);
+
+    if (i == 5 && s_pane[1].filter[0])
+        return "Filter: Active";
 
     return kOpsXbox[i];
 }
@@ -307,11 +426,474 @@ static int namecmp(const char* a, const char* b)
         ++i;
     }
 }
+static int namecontains(const char* text, const char* filter)
+{
+    int i;
+    int j;
+
+    if (!filter || !filter[0])
+        return 1;
+
+    if (!text)
+        return 0;
+
+    for (i = 0; text[i]; ++i)
+    {
+        for (j = 0; filter[j]; ++j)
+        {
+            char a = text[i + j];
+            char b = filter[j];
+
+            if (!a)
+                return 0;
+
+            if (a >= 'a' && a <= 'z') a -= 32;
+            if (b >= 'a' && b <= 'z') b -= 32;
+
+            if (a != b)
+                break;
+        }
+
+        if (!filter[j])
+            return 1;
+    }
+
+    return 0;
+}
+
 static int isdot(const char* n)
 {
     return n && n[0] == '.' && (n[1] == 0 || (n[1] == '.' && n[2] == 0));
 }
 static void setmsg(const char* m) { scpy(s_msg, sizeof(s_msg), m); }
+
+
+static int is_xbe_name(const char* name)
+{
+    int n;
+    char a, b, c;
+
+    if (!name)
+        return 0;
+
+    n = slen(name);
+    if (n < 4 || name[n - 4] != '.')
+        return 0;
+
+    a = name[n - 3];
+    b = name[n - 2];
+    c = name[n - 1];
+
+    if (a >= 'A' && a <= 'Z')a = (char)(a + ('a' - 'A'));
+    if (b >= 'A' && b <= 'Z')b = (char)(b + ('a' - 'A'));
+    if (c >= 'A' && c <= 'Z')c = (char)(c + ('a' - 'A'));
+
+    return a == 'x' && b == 'b' && c == 'e';
+}
+
+
+
+#define U2X_XBE_SIGNATURE              0x48454258UL
+
+
+static int U2x_ValidateXbe(
+    DDStorage* fs,
+    const char* path)
+{
+    DDFileHandle h;
+    DWORD sizeLo = 0;
+    DWORD sig = 0;
+    DWORD got = 0;
+    int ok = 0;
+
+    if (!fs ||
+        !path ||
+        !path[0] ||
+        !fs->open_read ||
+        !fs->read ||
+        !fs->close)
+    {
+        return 0;
+    }
+
+    h = fs->open_read(fs, path, &sizeLo);
+    if (!h)
+        return 0;
+
+    if (sizeLo >= sizeof(sig) &&
+        fs->read(fs, h, &sig, sizeof(sig), &got) &&
+        got == sizeof(sig) &&
+        sig == U2X_XBE_SIGNATURE)
+    {
+        ok = 1;
+    }
+
+    fs->close(fs, h);
+    return ok;
+}
+
+
+
+#define U2X_XBE_FILE_HEADER_BYTES       0x128UL
+#define U2X_XBE_IMAGEBASE_OFFSET        0x104UL
+#define U2X_XBE_CERTPTR_OFFSET          0x118UL
+#define U2X_XBE_INITFLAGS_OFFSET        0x124UL
+
+/* Certificate fields needed by the details panel. */
+#define U2X_XBE_CERT_INFO_BYTES         176UL
+#define U2X_XBE_CERT_TITLEID_OFFSET     8UL
+#define U2X_XBE_CERT_TITLENAME_OFFSET   12UL
+#define U2X_XBE_CERT_REGION_OFFSET      160UL
+#define U2X_XBE_CERT_DISC_OFFSET        168UL
+#define U2X_XBE_CERT_VERSION_OFFSET     172UL
+
+static DWORD U2x_ReadLe32(const BYTE* p)
+{
+    return ((DWORD)p[0]) |
+        ((DWORD)p[1] << 8) |
+        ((DWORD)p[2] << 16) |
+        ((DWORD)p[3] << 24);
+}
+
+static int U2x_FileReadExact(
+    DDStorage* fs,
+    DDFileHandle h,
+    void* dst,
+    DWORD bytes)
+{
+    BYTE* out = (BYTE*)dst;
+    DWORD done = 0;
+
+    while (done < bytes)
+    {
+        DWORD got = 0;
+        DWORD want = bytes - done;
+
+        if (!fs->read(fs, h, out + done, want, &got) || got == 0)
+            return 0;
+
+        done += got;
+    }
+
+    return 1;
+}
+
+static int U2x_FileSkip(
+    DDStorage* fs,
+    DDFileHandle h,
+    DWORD bytes)
+{
+    BYTE scratch[256];
+
+    while (bytes)
+    {
+        DWORD chunk = bytes > sizeof(scratch) ?
+            (DWORD)sizeof(scratch) : bytes;
+
+        if (!U2x_FileReadExact(fs, h, scratch, chunk))
+            return 0;
+
+        bytes -= chunk;
+    }
+
+    return 1;
+}
+
+static void U2x_XbeInfoInvalidate(void)
+{
+    ZeroMemory(&s_xbeInfo, sizeof(s_xbeInfo));
+}
+
+static void U2x_XbeTitleFromCertificate(
+    const BYTE* cert,
+    char* out,
+    int cap)
+{
+    int i;
+    int pos = 0;
+
+    if (!out || cap <= 0)
+        return;
+
+    out[0] = 0;
+
+    /* XBE certificate title is WCHAR[40], little-endian on Xbox. */
+    for (i = 0; i < 40 && pos < cap - 1; ++i)
+    {
+        BYTE lo = cert[U2X_XBE_CERT_TITLENAME_OFFSET + i * 2];
+        BYTE hi = cert[U2X_XBE_CERT_TITLENAME_OFFSET + i * 2 + 1];
+        unsigned short wc = (unsigned short)(lo | ((unsigned short)hi << 8));
+        char ch;
+
+        if (wc == 0)
+            break;
+
+        if (wc >= 32 && wc <= 126)
+            ch = (char)wc;
+        else if (wc == '\t' || wc == '\r' || wc == '\n')
+            ch = ' ';
+        else
+            ch = '?';
+
+        out[pos++] = ch;
+    }
+
+    while (pos > 0 && out[pos - 1] == ' ')
+        --pos;
+
+    out[pos] = 0;
+}
+
+static int U2x_ParseXbeInfo(
+    DDStorage* fs,
+    const char* path,
+    U2X_XBE_INFO* info)
+{
+    DDFileHandle h;
+    DWORD sizeLo = 0;
+    BYTE hdr[U2X_XBE_FILE_HEADER_BYTES];
+    BYTE cert[U2X_XBE_CERT_INFO_BYTES];
+    DWORD imageBase;
+    DWORD certVa;
+    DWORD certOff;
+    int ok = 0;
+
+    if (!fs || !path || !path[0] || !info ||
+        !fs->open_read || !fs->read || !fs->close)
+    {
+        return 0;
+    }
+
+    h = fs->open_read(fs, path, &sizeLo);
+    if (!h)
+        return 0;
+
+    if (sizeLo < U2X_XBE_FILE_HEADER_BYTES ||
+        !U2x_FileReadExact(fs, h, hdr, U2X_XBE_FILE_HEADER_BYTES) ||
+        U2x_ReadLe32(hdr) != U2X_XBE_SIGNATURE)
+    {
+        fs->close(fs, h);
+        return 0;
+    }
+
+    imageBase = U2x_ReadLe32(hdr + U2X_XBE_IMAGEBASE_OFFSET);
+    certVa = U2x_ReadLe32(hdr + U2X_XBE_CERTPTR_OFFSET);
+
+    if (certVa < imageBase)
+    {
+        fs->close(fs, h);
+        return 0;
+    }
+
+    certOff = certVa - imageBase;
+    if (certOff > sizeLo ||
+        sizeLo - certOff < U2X_XBE_CERT_INFO_BYTES)
+    {
+        fs->close(fs, h);
+        return 0;
+    }
+
+    if (certOff < U2X_XBE_FILE_HEADER_BYTES)
+    {
+        /* Rare but legal layout: reopen and walk from byte zero. */
+        fs->close(fs, h);
+        h = fs->open_read(fs, path, &sizeLo);
+        if (!h)
+            return 0;
+
+        if (!U2x_FileSkip(fs, h, certOff))
+        {
+            fs->close(fs, h);
+            return 0;
+        }
+    }
+    else if (!U2x_FileSkip(
+        fs,
+        h,
+        certOff - U2X_XBE_FILE_HEADER_BYTES))
+    {
+        fs->close(fs, h);
+        return 0;
+    }
+
+    if (U2x_FileReadExact(fs, h, cert, U2X_XBE_CERT_INFO_BYTES))
+    {
+        U2x_XbeTitleFromCertificate(cert, info->title, sizeof(info->title));
+        info->titleId = U2x_ReadLe32(cert + U2X_XBE_CERT_TITLEID_OFFSET);
+        info->region = U2x_ReadLe32(cert + U2X_XBE_CERT_REGION_OFFSET);
+        info->discNumber = U2x_ReadLe32(cert + U2X_XBE_CERT_DISC_OFFSET);
+        info->version = U2x_ReadLe32(cert + U2X_XBE_CERT_VERSION_OFFSET);
+        info->initFlags = U2x_ReadLe32(hdr + U2X_XBE_INITFLAGS_OFFSET);
+        ok = 1;
+    }
+
+    fs->close(fs, h);
+    return ok;
+}
+
+static const U2X_XBE_INFO* U2x_XbeInfoFor(
+    DDStorage* fs,
+    const char* path)
+{
+    if (!fs || !path || !path[0])
+        return 0;
+
+    if (s_xbeInfo.attempted &&
+        s_xbeInfo.fs == fs &&
+        namecmp(s_xbeInfo.path, path) == 0)
+    {
+        return s_xbeInfo.valid ? &s_xbeInfo : 0;
+    }
+
+    U2x_XbeInfoInvalidate();
+    s_xbeInfo.fs = fs;
+    scpy(s_xbeInfo.path, sizeof(s_xbeInfo.path), path);
+    s_xbeInfo.attempted = 1;
+    s_xbeInfo.valid = U2x_ParseXbeInfo(fs, path, &s_xbeInfo);
+
+    return s_xbeInfo.valid ? &s_xbeInfo : 0;
+}
+
+static const char* U2x_DeviceForDrive(char letter)
+{
+    int i;
+
+    if (letter >= 'a' && letter <= 'z')
+        letter = (char)(letter - ('a' - 'A'));
+
+    for (i = 0; i < U2X_HDD_DRIVE_COUNT; ++i)
+    {
+        if (kU2xHddDrives[i].letter == letter)
+            return kU2xHddDrives[i].device;
+    }
+
+    return 0;
+}
+
+
+static int U2x_BuildNativeDirectory(
+    const char* fatxDir,
+    char* out,
+    int cap)
+{
+    const char* dev;
+    const char* rest;
+
+    if (!fatxDir ||
+        !fatxDir[0] ||
+        fatxDir[1] != ':' ||
+        !out ||
+        cap <= 0)
+    {
+        return 0;
+    }
+
+    dev = U2x_DeviceForDrive(fatxDir[0]);
+    if (!dev)
+        return 0;
+
+    scpy(out, cap, dev);
+    rest = fatxDir + 2;
+
+    if (rest[0])
+    {
+        int n = slen(out);
+
+        if (rest[0] != '\\' && rest[0] != '/')
+        {
+            if (n + 1 >= cap)
+                return 0;
+
+            out[n++] = '\\';
+            out[n] = 0;
+        }
+
+        if (slen(out) + slen(rest) >= cap)
+            return 0;
+
+        scat(out, cap, rest);
+    }
+
+    return 1;
+}
+
+
+static int U2x_MapDToFatxDirectory(const char* fatxDir)
+{
+    char nativeDir[FM_PATH_MAX + 64];
+    char dLinkBuf[8];
+    U2X_XBOX_STRING sLink;
+    U2X_XBOX_STRING sDev;
+    int devLen;
+    LONG st;
+
+    if (!U2x_BuildNativeDirectory(
+        fatxDir,
+        nativeDir,
+        sizeof(nativeDir)))
+    {
+        return 0;
+    }
+
+    dLinkBuf[0] = '\\';
+    dLinkBuf[1] = '?';
+    dLinkBuf[2] = '?';
+    dLinkBuf[3] = '\\';
+    dLinkBuf[4] = 'D';
+    dLinkBuf[5] = ':';
+    dLinkBuf[6] = 0;
+
+    sLink.Length = 6;
+    sLink.MaximumLength = 7;
+    sLink.Buffer = dLinkBuf;
+
+    devLen = slen(nativeDir);
+    sDev.Length = (USHORT)devLen;
+    sDev.MaximumLength = (USHORT)(devLen + 1);
+    sDev.Buffer = nativeDir;
+
+    IoDeleteSymbolicLink(&sLink);
+    st = IoCreateSymbolicLink(&sLink, &sDev);
+
+    return st >= 0 ? 1 : 0;
+}
+
+
+static int U2x_LaunchFatxXbe(
+    const char* fatxDir,
+    const char* xbeName)
+{
+    char launchPath[FM_NAME_MAX + 4];
+    DWORD rc;
+
+    if (!fatxDir ||
+        !fatxDir[0] ||
+        !xbeName ||
+        !xbeName[0] ||
+        !is_xbe_name(xbeName))
+    {
+        return 0;
+    }
+
+    if (!U2x_MapDToFatxDirectory(fatxDir))
+        return 0;
+
+    scpy(launchPath, sizeof(launchPath), "D:\\");
+    scat(launchPath, sizeof(launchPath), xbeName);
+
+    setmsg("Launching XBE...");
+    USB2XB_AudioPlay(U2X_SOUND_CONFIRM);
+
+    rc = XLaunchNewImage(
+        launchPath,
+        0);
+
+    /*
+        A successful launch quick-reboots and does not return. Any return means
+        the launch request itself failed.
+    */
+    return rc == ERROR_SUCCESS ? 1 : 0;
+}
 
 
 static void addentry(
@@ -331,6 +913,7 @@ static void addentry(
 
     scpy(e->name, sizeof(e->name), name);
     e->sizeLo = sizeLo;
+    e->sortTime = 0;
     e->isDir = isDir;
     e->isDrive = isDrive;
     e->devPath[0] = 0;
@@ -394,28 +977,284 @@ static void load_xbox_drive_list(Pane* p)
 }
 
 
+static int sort_compare(
+    const Pane* p,
+    const FmEntry* a,
+    const FmEntry* b)
+{
+    int mode;
+
+    if (a->isDir != b->isDir)
+        return a->isDir ? -1 : 1;
+
+    mode = p ? p->sortMode : FM_SORT_NAME;
+
+    /*
+        Size is only meaningful for files. Directories remain alphabetical
+        while still grouped ahead of files.
+    */
+    if (mode == FM_SORT_SIZE &&
+        !a->isDir &&
+        a->sizeLo != b->sizeLo)
+    {
+        return a->sizeLo > b->sizeLo ? -1 : 1;
+    }
+
+    /*
+        Date uses each backend's native sortable last-write value. Newest first.
+        A zero timestamp simply falls through to the stable name tie-breaker.
+    */
+    if (mode == FM_SORT_DATE &&
+        a->sortTime != b->sortTime)
+    {
+        return a->sortTime > b->sortTime ? -1 : 1;
+    }
+
+    return namecmp(a->name, b->name);
+}
+
+
 static void sortpane(Pane* p)
 {
-    int i, j;
-    for (i = 1; i < p->count; ++i) {
+    int i;
+    int j;
+
+    if (!p)
+        return;
+
+    for (i = 1; i < p->count; ++i)
+    {
         FmEntry t = p->ent[i];
+
         j = i - 1;
-        while (j >= 0) {
-            FmEntry* e = &p->ent[j];
-            int keep;
-            if (e->isDir != t.isDir) keep = (e->isDir && !t.isDir);
-            else keep = (namecmp(e->name, t.name) <= 0);
-            if (keep)break;
+
+        while (j >= 0 &&
+            sort_compare(
+                p,
+                &p->ent[j],
+                &t) > 0)
+        {
             p->ent[j + 1] = p->ent[j];
             --j;
         }
+
         p->ent[j + 1] = t;
     }
+}
+
+
+static void change_sort_mode(Pane* p, int direction)
+{
+    char selectedName[FM_NAME_MAX];
+    int selectedIsDir = 0;
+    int selectedIsDrive = 0;
+    int hadSelection = 0;
+    int i;
+
+    if (!p)
+        return;
+
+    selectedName[0] = 0;
+
+    if (p->cursor >= 0 &&
+        p->cursor < p->count)
+    {
+        scpy(
+            selectedName,
+            sizeof(selectedName),
+            p->ent[p->cursor].name);
+
+        selectedIsDir =
+            p->ent[p->cursor].isDir;
+
+        selectedIsDrive =
+            p->ent[p->cursor].isDrive;
+
+        hadSelection = 1;
+    }
+
+    if (direction < 0)
+    {
+        --p->sortMode;
+        if (p->sortMode < 0)
+            p->sortMode = FM_SORT_COUNT - 1;
+    }
+    else
+    {
+        ++p->sortMode;
+        if (p->sortMode >= FM_SORT_COUNT)
+            p->sortMode = 0;
+    }
+
+    sortpane(p);
+
+    if (hadSelection)
+    {
+        for (i = 0; i < p->count; ++i)
+        {
+            if (p->ent[i].isDir == selectedIsDir &&
+                p->ent[i].isDrive == selectedIsDrive &&
+                namecmp(
+                    p->ent[i].name,
+                    selectedName) == 0)
+            {
+                p->cursor = i;
+                break;
+            }
+        }
+    }
+
+    if (p->count <= 0)
+    {
+        p->cursor = 0;
+        p->scroll = 0;
+    }
+    else
+    {
+        if (p->cursor < 0)
+            p->cursor = 0;
+
+        if (p->cursor >= p->count)
+            p->cursor = p->count - 1;
+
+        if (p->cursor < p->scroll)
+            p->scroll = p->cursor;
+
+        if (p->cursor >=
+            p->scroll + FM_VISIBLE_ROWS)
+        {
+            p->scroll =
+                p->cursor -
+                FM_VISIBLE_ROWS + 1;
+        }
+
+        if (p->scroll < 0)
+            p->scroll = 0;
+    }
+
+    p->marqueeCursor = -1;
+    p->marqueeStart = GetTickCount();
+}
+
+static void cycle_sort_mode(Pane* p)
+{
+    change_sort_mode(p, 1);
 }
 
 static int pane_ready(Pane* p)
 {
     return p && p->fs && (!p->fs->ready || p->fs->ready(p->fs));
+}
+
+static void pane_space_refresh(Pane* p)
+{
+    if (!p)
+        return;
+
+    p->freeBytes = 0;
+    p->totalBytes = 0;
+    p->spaceValid = 0;
+    p->freeKnown = 0;
+
+    if (!pane_ready(p))
+        return;
+
+    if (p == &s_pane[0])
+    {
+        if (USB2XB_StorageUsbSpace(
+            &p->freeBytes,
+            &p->totalBytes,
+            &p->freeKnown))
+        {
+            p->spaceValid = 1;
+        }
+        return;
+    }
+
+    /* The Xbox virtual drive-list root has no single capacity. */
+    if (p == &s_pane[1] &&
+        p->path[0] &&
+        p->path[1] == ':')
+    {
+        char root[4];
+        ULARGE_INTEGER avail;
+        ULARGE_INTEGER total;
+        ULARGE_INTEGER totalFree;
+
+        root[0] = p->path[0];
+        root[1] = ':';
+        root[2] = '\\';
+        root[3] = 0;
+
+        ZeroMemory(&avail, sizeof(avail));
+        ZeroMemory(&total, sizeof(total));
+        ZeroMemory(&totalFree, sizeof(totalFree));
+
+        if (GetDiskFreeSpaceEx(
+            root,
+            &avail,
+            &total,
+            &totalFree))
+        {
+            p->freeBytes = avail.QuadPart;
+            p->totalBytes = total.QuadPart;
+            p->spaceValid = 1;
+            p->freeKnown = 1;
+        }
+    }
+}
+
+static int copy_destination_space(ULONGLONG* freeBytes, int* freeKnown)
+{
+    if (freeBytes)
+        *freeBytes = 0;
+    if (freeKnown)
+        *freeKnown = 0;
+
+    /* USB-app staging always targets USB2XB's own D: volume. */
+    if (s_launchStaging)
+    {
+        ULARGE_INTEGER avail;
+        ULARGE_INTEGER total;
+        ULARGE_INTEGER totalFree;
+
+        ZeroMemory(&avail, sizeof(avail));
+        ZeroMemory(&total, sizeof(total));
+        ZeroMemory(&totalFree, sizeof(totalFree));
+
+        if (!GetDiskFreeSpaceEx(
+            "D:\\",
+            &avail,
+            &total,
+            &totalFree))
+        {
+            return 0;
+        }
+
+        if (freeBytes)
+            *freeBytes = avail.QuadPart;
+        if (freeKnown)
+            *freeKnown = 1;
+        return 1;
+    }
+
+    if (s_pendDest >= 0 && s_pendDest < 2)
+    {
+        Pane* p = &s_pane[s_pendDest];
+
+        pane_space_refresh(p);
+
+        if (p->spaceValid)
+        {
+            if (freeBytes)
+                *freeBytes = p->freeBytes;
+            if (freeKnown)
+                *freeKnown = p->freeKnown;
+            return 1;
+        }
+    }
+
+    return 0;
 }
 
 static void loadpane(Pane* p)
@@ -424,11 +1263,18 @@ static void loadpane(Pane* p)
     DDDirEntry de;
     int more;
 
+    /* A reload may replace an XBE at the same path; do not retain stale metadata. */
+    U2x_XbeInfoInvalidate();
+
     p->count = 0;
     p->cursor = 0;
     p->scroll = 0;
     p->marqueeCursor = -1;
     p->marqueeStart = GetTickCount();
+    p->freeBytes = 0;
+    p->totalBytes = 0;
+    p->spaceValid = 0;
+    p->freeKnown = 0;
 
     /*
         DarkDash virtual root applies to the Xbox pane only.
@@ -441,15 +1287,21 @@ static void loadpane(Pane* p)
         return;
     }
 
-    if (!pane_ready(p) || !p->fs->list_begin) return;
+    if (!pane_ready(p)) return;
+
+    pane_space_refresh(p);
+
+    if (!p->fs->list_begin) return;
 
     ZeroMemory(&h, sizeof(h));
     more = p->fs->list_begin(p->fs, p->path, &h, &de);
     while (more && p->count < FM_MAX_ENTRIES) {
-        if (!isdot(de.name)) {
+        if (!isdot(de.name) &&
+            namecontains(de.name, p->filter)) {
             FmEntry* e = &p->ent[p->count++];
             scpy(e->name, sizeof(e->name), de.name);
             e->sizeLo = de.sizeLo;
+            e->sortTime = de.sortTime;
             e->isDir = de.isDir;
             e->isDrive = 0;
             e->devPath[0] = 0;
@@ -508,6 +1360,7 @@ static void enter(Pane* p)
     if (!p->ent[p->cursor].isDir)return;
     entrypath(p, p->cursor, np, sizeof(np));
     scpy(p->path, sizeof(p->path), np);
+    p->filter[0] = 0;
     loadpane(p);
     USB2XB_AudioPlay(U2X_SOUND_CONFIRM);
 }
@@ -536,6 +1389,7 @@ static void up(Pane* p)
             (p->path[2] == '\\' || p->path[2] == '/'))
         {
             p->path[0] = 0;
+            p->filter[0] = 0;
             loadpane(p);
             USB2XB_AudioPlay(U2X_SOUND_BACK);
             return;
@@ -560,6 +1414,7 @@ static void up(Pane* p)
         }
 
         scpy(p->path, sizeof(p->path), parent);
+        p->filter[0] = 0;
         loadpane(p);
         USB2XB_AudioPlay(U2X_SOUND_BACK);
         return;
@@ -586,6 +1441,7 @@ static void up(Pane* p)
         parent[last] = 0;
 
     scpy(p->path, sizeof(p->path), parent);
+    p->filter[0] = 0;
     loadpane(p);
     USB2XB_AudioPlay(U2X_SOUND_BACK);
 }
@@ -687,10 +1543,491 @@ static int builditems(Pane* p, CopyJobItem* items, int cap)
         scpy(items[n].src, sizeof(items[n].src), path);
         scpy(items[n].name, sizeof(items[n].name), p->ent[i].name);
         items[n].isDir = p->ent[i].isDir;
+        items[n].sizeLo = p->ent[i].isDir ? 0 : p->ent[i].sizeLo;
         ++n;
     }
 
     return n;
+}
+
+
+
+/*
+    USB staged launch handoff.
+
+    The selected USB application's containing directory is copied into a private
+    folder inside USB2XB's own title directory:
+
+        D:\USB2XB_STAGE\
+
+    D: is USB2XB's current title-directory mapping while this process is alive,
+    so this path follows USB2XB regardless of whether it was installed on E:, F:,
+    G:, etc.  At handoff we query D:'s current native symbolic-link target, append
+    USB2XB_STAGE, rebind D: to that native folder, and launch D:\<selected>.xbe.
+
+    Only USB2XB_STAGE is ever purged; the containing application directory is
+    left untouched.
+*/
+static int U2x_ClearFatxDirectoryContents(
+    DDStorage* fs,
+    const char* dir)
+{
+    int guard = 0;
+
+    if (!fs || !dir || !dir[0] ||
+        !fs->list_begin || !fs->list_next || !fs->list_end)
+    {
+        return 0;
+    }
+
+    for (;;)
+    {
+        DDDirHandle h;
+        DDDirEntry de;
+        char child[FM_PATH_MAX];
+        int more;
+        int found = 0;
+        int isDir = 0;
+
+        ZeroMemory(&h, sizeof(h));
+        more = fs->list_begin(fs, dir, &h, &de);
+
+        while (more)
+        {
+            if (!isdot(de.name))
+            {
+                if (!join_checked(
+                    child,
+                    sizeof(child),
+                    dir,
+                    de.name))
+                {
+                    if (h.impl)
+                        fs->list_end(fs, &h);
+                    return 0;
+                }
+
+                found = 1;
+                isDir = de.isDir;
+                break;
+            }
+
+            more = fs->list_next(fs, &h, &de);
+        }
+
+        if (h.impl)
+            fs->list_end(fs, &h);
+
+        if (!found)
+            return 1;
+
+        if (!Fileops_DeletePath(fs, child, isDir))
+            return 0;
+
+        /* Corrupt/cyclic directory protection. */
+        if (++guard > 8192)
+            return 0;
+    }
+}
+
+
+static int U2x_EnsureLaunchStageDirectory(DDStorage* fs)
+{
+    DWORD attr;
+
+    if (!fs || !fs->mkdir || !fs->exists)
+        return 0;
+
+    scpy(
+        s_launchStageDir,
+        sizeof(s_launchStageDir),
+        "D:\\USB2XB_STAGE");
+
+    attr = GetFileAttributesA(s_launchStageDir);
+
+    if (attr == 0xFFFFFFFF)
+    {
+        if (!fs->mkdir(fs, s_launchStageDir))
+            return 0;
+
+        attr = GetFileAttributesA(s_launchStageDir);
+    }
+
+    if (attr == 0xFFFFFFFF ||
+        !(attr & FILE_ATTRIBUTE_DIRECTORY))
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
+
+static int U2x_QueryCurrentDTarget(
+    char* out,
+    int cap)
+{
+    char linkBuf[] = "\\??\\D:";
+    U2X_XBOX_STRING linkName;
+    U2X_XBOX_STRING target;
+    U2X_OBJECT_ATTRIBUTES oa;
+    HANDLE hLink = 0;
+    LONG st;
+    int n;
+
+    if (!out || cap <= 1)
+        return 0;
+
+    out[0] = 0;
+
+    linkName.Length = 6;
+    linkName.MaximumLength = 7;
+    linkName.Buffer = linkBuf;
+
+    oa.RootDirectory = 0;
+    oa.ObjectName = &linkName;
+    oa.Attributes = U2X_OBJ_CASE_INSENSITIVE;
+
+    st = NtOpenSymbolicLinkObject(
+        &hLink,
+        &oa);
+
+    if (st < 0 || !hLink)
+        return 0;
+
+    target.Length = 0;
+    target.MaximumLength = (USHORT)(cap - 1);
+    target.Buffer = out;
+
+    st = NtQuerySymbolicLinkObject(
+        hLink,
+        &target,
+        0);
+
+    NtClose(hLink);
+
+    if (st < 0)
+    {
+        out[0] = 0;
+        return 0;
+    }
+
+    n = (int)target.Length;
+    if (n < 0 || n >= cap)
+    {
+        out[0] = 0;
+        return 0;
+    }
+
+    out[n] = 0;
+    return n > 0 ? 1 : 0;
+}
+
+
+static int U2x_BuildStageNativeDirectory(
+    const char* currentDTarget,
+    char* out,
+    int cap)
+{
+    static const char stageLeaf[] = "\\USB2XB_STAGE";
+    int n;
+
+    if (!currentDTarget || !currentDTarget[0] || !out || cap <= 0)
+        return 0;
+
+    n = slen(currentDTarget);
+    if (n + (int)sizeof(stageLeaf) > cap)
+        return 0;
+
+    scpy(out, cap, currentDTarget);
+    scat(out, cap, stageLeaf);
+    return 1;
+}
+
+
+static int U2x_MapDToNativeDirectory(
+    const char* nativeDir)
+{
+    char linkBuf[] = "\\??\\D:";
+    U2X_XBOX_STRING sLink;
+    U2X_XBOX_STRING sDev;
+    int devLen;
+
+    if (!nativeDir || !nativeDir[0])
+        return 0;
+
+    sLink.Length = 6;
+    sLink.MaximumLength = 7;
+    sLink.Buffer = linkBuf;
+
+    devLen = slen(nativeDir);
+    sDev.Length = (USHORT)devLen;
+    sDev.MaximumLength = (USHORT)(devLen + 1);
+    sDev.Buffer = (char*)nativeDir;
+
+    IoDeleteSymbolicLink(&sLink);
+    return IoCreateSymbolicLink(&sLink, &sDev) == 0 ? 1 : 0;
+}
+
+
+static int U2x_LaunchSelfStage(
+    const char* xbeName)
+{
+    char currentD[FM_PATH_MAX + 64];
+    char nativeStage[FM_PATH_MAX + 64];
+    char launchPath[FM_NAME_MAX + 4];
+    DWORD rc;
+
+    if (!xbeName || !xbeName[0] || !is_xbe_name(xbeName))
+        return 0;
+
+    /*
+        USB2XB is already running with D: mapped to its application directory.
+        Capture that exact native target, append the private staging folder,
+        then use the same D:-remap + XLaunchNewImage path as the normal FATX
+        launcher.  No image-path reconstruction or cache-drive special case.
+    */
+    if (!U2x_QueryCurrentDTarget(
+        currentD,
+        sizeof(currentD)) ||
+        !U2x_BuildStageNativeDirectory(
+            currentD,
+            nativeStage,
+            sizeof(nativeStage)))
+    {
+        return 0;
+    }
+
+    if (!U2x_MapDToNativeDirectory(nativeStage))
+        return 0;
+
+    scpy(launchPath, sizeof(launchPath), "D:\\");
+    scat(launchPath, sizeof(launchPath), xbeName);
+
+    setmsg("Launching XBE...");
+    USB2XB_AudioPlay(U2X_SOUND_CONFIRM);
+
+    rc = XLaunchNewImage(launchPath, NULL);
+
+    /* Successful launch quick-reboots and never returns. Restore only on fail. */
+    U2x_MapDToNativeDirectory(currentD);
+    return rc == ERROR_SUCCESS ? 1 : 0;
+}
+
+
+static int start_usb_xbe_launch(
+    Pane* p,
+    const char* xbeName)
+{
+    static CopyJobItem launchItems[FM_MAX_ENTRIES];
+    DDDirHandle h;
+    DDDirEntry de;
+    char xbePath[FM_PATH_MAX];
+    int more;
+    int n = 0;
+
+    if (!p ||
+        p != &s_pane[0] ||
+        !xbeName ||
+        !xbeName[0] ||
+        !is_xbe_name(xbeName))
+    {
+        return 0;
+    }
+
+    if (!pane_ready(p) ||
+        !p->path[0] ||
+        !s_pane[1].fs)
+    {
+        setmsg("Storage not ready");
+        USB2XB_AudioPlay(U2X_SOUND_ERROR);
+        return 0;
+    }
+
+    /* Validate the selected source before clearing the launch cache. */
+    if (!join_checked(
+        xbePath,
+        sizeof(xbePath),
+        p->path,
+        xbeName) ||
+        !U2x_ValidateXbe(
+            p->fs,
+            xbePath))
+    {
+        setmsg("Invalid or unreadable XBE");
+        USB2XB_AudioPlay(U2X_SOUND_ERROR);
+        return 0;
+    }
+
+    /*
+        Keep launch scratch data beside USB2XB itself, never on X/Y/Z. Create the
+        private folder once, then purge only its contents on every launch.
+    */
+    if (!U2x_EnsureLaunchStageDirectory(s_pane[1].fs))
+    {
+        setmsg("Unable to create launch folder");
+        USB2XB_AudioPlay(U2X_SOUND_ERROR);
+        return 0;
+    }
+
+    if (!U2x_ClearFatxDirectoryContents(
+        s_pane[1].fs,
+        s_launchStageDir))
+    {
+        setmsg("Unable to clear launch folder");
+        USB2XB_AudioPlay(U2X_SOUND_ERROR);
+        return 0;
+    }
+
+    /*
+        Stage the CONTENTS of the USB application's containing directory into
+        D:\USB2XB_STAGE. Each top-level child becomes one CopyJob source item,
+        so nested directories still use the normal proven recursive copy path.
+    */
+    ZeroMemory(launchItems, sizeof(launchItems));
+    ZeroMemory(&h, sizeof(h));
+
+    if (!p->fs->list_begin || !p->fs->list_next || !p->fs->list_end)
+    {
+        setmsg("USB directory unavailable");
+        USB2XB_AudioPlay(U2X_SOUND_ERROR);
+        return 0;
+    }
+
+    more = p->fs->list_begin(p->fs, p->path, &h, &de);
+    while (more)
+    {
+        if (!isdot(de.name))
+        {
+            if (n >= FM_MAX_ENTRIES)
+            {
+                if (h.impl)
+                    p->fs->list_end(p->fs, &h);
+                setmsg("Too many launch files");
+                USB2XB_AudioPlay(U2X_SOUND_ERROR);
+                return 0;
+            }
+
+            launchItems[n].fs = p->fs;
+            if (!join_checked(
+                launchItems[n].src,
+                sizeof(launchItems[n].src),
+                p->path,
+                de.name))
+            {
+                if (h.impl)
+                    p->fs->list_end(p->fs, &h);
+                setmsg("Launch source path too long");
+                USB2XB_AudioPlay(U2X_SOUND_ERROR);
+                return 0;
+            }
+
+            scpy(
+                launchItems[n].name,
+                sizeof(launchItems[n].name),
+                de.name);
+            launchItems[n].isDir = de.isDir;
+            launchItems[n].sizeLo = de.isDir ? 0 : de.sizeLo;
+            ++n;
+        }
+
+        more = p->fs->list_next(p->fs, &h, &de);
+    }
+
+    if (h.impl)
+        p->fs->list_end(p->fs, &h);
+
+    if (n <= 0)
+    {
+        setmsg("USB app folder is empty");
+        USB2XB_AudioPlay(U2X_SOUND_ERROR);
+        return 0;
+    }
+
+    scpy(
+        s_launchXbeName,
+        sizeof(s_launchXbeName),
+        xbeName);
+
+    if (!CopyJob_Begin(
+        launchItems,
+        n,
+        s_pane[1].fs,
+        s_launchStageDir,
+        0))
+    {
+        const char* err = CopyJob_ErrorText();
+
+        setmsg(
+            (err && err[0]) ?
+            err :
+            "Unable to stage XBE");
+
+        USB2XB_AudioPlay(U2X_SOUND_ERROR);
+        return 0;
+    }
+
+    s_launchStaging = 1;
+    s_copyPreflightChecked = 0;
+    s_copyPreflightNoSpace = 0;
+    s_copyMove = 0;
+    s_pendSrc = 0;
+    s_pendDest = 1;
+    s_mode = FM_COPYING;
+
+    setmsg("Preparing USB app...");
+    USB2XB_AudioPlay(U2X_SOUND_CONFIRM);
+    return 1;
+}
+
+
+static int launch_selected_xbe(Pane* p)
+{
+    FmEntry* e;
+
+    if (!p ||
+        p->cursor < 0 ||
+        p->cursor >= p->count)
+    {
+        return 0;
+    }
+
+    e = &p->ent[p->cursor];
+
+    if (e->isDir ||
+        e->isDrive ||
+        !is_xbe_name(e->name))
+    {
+        return 0;
+    }
+
+    if (p == &s_pane[0])
+    {
+        start_usb_xbe_launch(p, e->name);
+        return 1;
+    }
+
+    if (p == &s_pane[1])
+    {
+        if (!p->path[0])
+        {
+            setmsg("Open an Xbox drive first");
+            USB2XB_AudioPlay(U2X_SOUND_ERROR);
+            return 1;
+        }
+
+        if (!U2x_LaunchFatxXbe(
+            p->path,
+            e->name))
+        {
+            setmsg("Unable to launch XBE");
+            USB2XB_AudioPlay(U2X_SOUND_ERROR);
+        }
+
+        return 1;
+    }
+
+    return 0;
 }
 
 
@@ -804,6 +2141,8 @@ static int start_staged_copy(void)
         dst->path,
         s_copyMove))
     {
+        s_copyPreflightChecked = 0;
+        s_copyPreflightNoSpace = 0;
         s_mode = FM_COPYING;
         setmsg(s_copyMove ? "Moving..." : "Copying...");
         USB2XB_AudioPlay(U2X_SOUND_CONFIRM);
@@ -937,6 +2276,91 @@ static void begin_mkdir_osk(void)
 
     s_mode = FM_OSK_MKDIR;
     setmsg("Enter folder name");
+    USB2XB_AudioPlay(U2X_SOUND_CONFIRM);
+}
+
+static void apply_filter(Pane* p, const char* text)
+{
+    char selectedName[FM_NAME_MAX];
+    int selectedIsDir = 0;
+    int selectedIsDrive = 0;
+    int hadSelection = 0;
+    int i;
+
+    if (!p)
+        return;
+
+    selectedName[0] = 0;
+
+    if (p->cursor >= 0 && p->cursor < p->count)
+    {
+        scpy(selectedName, sizeof(selectedName), p->ent[p->cursor].name);
+        selectedIsDir = p->ent[p->cursor].isDir;
+        selectedIsDrive = p->ent[p->cursor].isDrive;
+        hadSelection = 1;
+    }
+
+    scpy(p->filter, sizeof(p->filter), text ? text : "");
+    loadpane(p);
+
+    if (hadSelection)
+    {
+        for (i = 0; i < p->count; ++i)
+        {
+            if (p->ent[i].isDir == selectedIsDir &&
+                p->ent[i].isDrive == selectedIsDrive &&
+                namecmp(p->ent[i].name, selectedName) == 0)
+            {
+                p->cursor = i;
+                break;
+            }
+        }
+    }
+
+    if (p->cursor >= p->count && p->count > 0)
+        p->cursor = p->count - 1;
+
+    if (p->cursor < 0)
+        p->cursor = 0;
+
+    if (p->cursor < p->scroll)
+        p->scroll = p->cursor;
+
+    if (p->cursor >= p->scroll + FM_VISIBLE_ROWS)
+        p->scroll = p->cursor - FM_VISIBLE_ROWS + 1;
+
+    if (p->scroll < 0)
+        p->scroll = 0;
+
+    p->marqueeCursor = -1;
+    p->marqueeStart = GetTickCount();
+}
+
+static void begin_filter_osk(void)
+{
+    Pane* p = &s_pane[s_active];
+
+    if (!p || !pane_ready(p))
+    {
+        setmsg("Filter unavailable");
+        USB2XB_AudioPlay(U2X_SOUND_ERROR);
+        return;
+    }
+
+    if (p == &s_pane[1] && p->path[0] == 0)
+    {
+        setmsg("Open an Xbox drive first");
+        USB2XB_AudioPlay(U2X_SOUND_ERROR);
+        return;
+    }
+
+    Osk_Open(
+        OSK_TEXT,
+        p->filter,
+        FM_FILTER_MAX - 1);
+
+    s_mode = FM_OSK_FILTER;
+    setmsg("Filter text - blank clears");
     USB2XB_AudioPlay(U2X_SOUND_CONFIRM);
 }
 
@@ -1299,6 +2723,9 @@ void FileMan_Init(DDStorage* left, const char* leftRoot,
     s_pendDest = 1;
     s_renameOldPath[0] = 0;
     s_renamePane = 0;
+    s_launchStaging = 0;
+    s_launchXbeName[0] = 0;
+    s_launchStageDir[0] = 0;
     s_helperOpen = UI_IsWide() ? 1 : 0;
     s_usbHotplugBootstrapped = 0;
     Osk_Close();
@@ -1631,11 +3058,81 @@ static void toggle_mark(Pane* p)
 }
 
 
+static int open_selected_hex(void)
+{
+    Pane* p = &s_pane[s_active];
+    char path[FM_PATH_MAX];
+
+    if (!p ||
+        p->cursor < 0 ||
+        p->cursor >= p->count ||
+        p->ent[p->cursor].isDir ||
+        p->ent[p->cursor].isDrive)
+    {
+        setmsg("Select a file first");
+        USB2XB_AudioPlay(U2X_SOUND_ERROR);
+        return 0;
+    }
+
+    entrypath(p, p->cursor, path, sizeof(path));
+
+    if (!HexViewer_Open(
+        p->fs,
+        path,
+        p->ent[p->cursor].name))
+    {
+        setmsg("Unable to open hex viewer");
+        USB2XB_AudioPlay(U2X_SOUND_ERROR);
+        return 0;
+    }
+
+    s_mode = FM_BROWSE;
+    USB2XB_AudioPlay(U2X_SOUND_CONFIRM);
+    return 1;
+}
+
+
+static int open_selected_checksum(void)
+{
+    Pane* p = &s_pane[s_active];
+    char path[FM_PATH_MAX];
+
+    if (!p ||
+        p->cursor < 0 ||
+        p->cursor >= p->count ||
+        p->ent[p->cursor].isDir ||
+        p->ent[p->cursor].isDrive)
+    {
+        setmsg("Select a file first");
+        USB2XB_AudioPlay(U2X_SOUND_ERROR);
+        return 0;
+    }
+
+    entrypath(p, p->cursor, path, sizeof(path));
+
+    if (!ChecksumViewer_Open(
+        p->fs,
+        path,
+        p->ent[p->cursor].name))
+    {
+        setmsg("Unable to calculate checksums");
+        USB2XB_AudioPlay(U2X_SOUND_ERROR);
+        return 0;
+    }
+
+    s_mode = FM_BROWSE;
+    USB2XB_AudioPlay(U2X_SOUND_CONFIRM);
+    return 1;
+}
+
+
 static void run_context_action(int which)
 {
     /*
-        Xbox: New Folder / Rename / Delete
-        USB:  New Folder / Rename / Delete / Rescan / Unmount|Mount / Format
+        Xbox: New Folder / Rename / Delete / Hex Viewer / Checksums /
+              Filter / Sort
+        USB:  New Folder / Rename / Delete / Hex Viewer / Checksums / Filter /
+              Rescan / Unmount|Mount / Format / Sort
     */
     if (which == 0)
     {
@@ -1655,7 +3152,33 @@ static void run_context_action(int which)
         return;
     }
 
-    if (s_active == 0 && which == 3)
+    if (which == 3)
+    {
+        open_selected_hex();
+        return;
+    }
+
+    if (which == 4)
+    {
+        open_selected_checksum();
+        return;
+    }
+
+    if (which == 5)
+    {
+        begin_filter_osk();
+        return;
+    }
+
+    if ((s_active == 0 && which == 9) ||
+        (s_active == 1 && which == 6))
+    {
+        setmsg("Use LEFT / RIGHT to change sort");
+        USB2XB_AudioPlay(U2X_SOUND_NAV);
+        return;
+    }
+
+    if (s_active == 0 && which == 6)
     {
         s_usbHotplugBootstrapped = 1;
         USB2XB_USB_RequestScan();
@@ -1665,21 +3188,17 @@ static void run_context_action(int which)
         return;
     }
 
-    if (s_active == 0 && which == 4)
+    if (s_active == 0 && which == 7)
     {
         if (USB2XB_StorageUsbUserUnmounted())
         {
-            /*
-                Logical remount only re-enables FAT mounting.  Physical
-                reconnect is handled automatically by the USB hotplug path;
-                do not restart low-level enumeration for a live device.
-            */
             USB2XB_StorageUsbRemount();
 
             scpy(
                 s_pane[0].path,
                 sizeof(s_pane[0].path),
                 s_pane[0].root);
+            s_pane[0].filter[0] = 0;
 
             setmsg("USB mount enabled");
         }
@@ -1691,6 +3210,7 @@ static void run_context_action(int which)
                 s_pane[0].path,
                 sizeof(s_pane[0].path),
                 s_pane[0].root);
+            s_pane[0].filter[0] = 0;
 
             loadpane(&s_pane[0]);
             setmsg("USB unmounted");
@@ -1701,7 +3221,7 @@ static void run_context_action(int which)
         return;
     }
 
-    if (s_active == 0 && which == 5)
+    if (s_active == 0 && which == 8)
     {
         begin_format_confirm();
         return;
@@ -1714,6 +3234,25 @@ int FileMan_Update(WORD pressed, WORD held)
     Pane* p = &s_pane[s_active];
 
     USB2XB_AudioPump();
+
+    if (TextViewer_IsActive())
+    {
+        TextViewer_Update(pressed, held);
+        return 0;
+    }
+
+    if (HexViewer_IsActive())
+    {
+        HexViewer_Update(pressed, held);
+        return 0;
+    }
+
+    if (ChecksumViewer_IsActive())
+    {
+        ChecksumViewer_Update(pressed, held);
+        return 0;
+    }
+
     WORD nav = vertical_nav_with_repeat(pressed, held);
     int stickSwitch = 0;
     int usbRawReadyNow =
@@ -1747,7 +3286,8 @@ int FileMan_Update(WORD pressed, WORD held)
     }
 
     if (s_mode == FM_OSK_MKDIR ||
-        s_mode == FM_OSK_RENAME)
+        s_mode == FM_OSK_RENAME ||
+        s_mode == FM_OSK_FILTER)
     {
         int oskMode = s_mode;
         int r = Osk_Update(pressed);
@@ -1759,7 +3299,13 @@ int FileMan_Update(WORD pressed, WORD held)
             Osk_GetText(name, sizeof(name));
             Osk_Close();
 
-            if (name[0])
+            if (oskMode == FM_OSK_FILTER)
+            {
+                apply_filter(&s_pane[s_active], name);
+                setmsg(name[0] ? "Filter applied" : "Filter cleared");
+                USB2XB_AudioPlay(U2X_SOUND_CONFIRM);
+            }
+            else if (name[0])
             {
                 if (oskMode == FM_OSK_MKDIR)
                     create_named_folder(
@@ -1785,7 +3331,9 @@ int FileMan_Update(WORD pressed, WORD held)
             setmsg(
                 oskMode == FM_OSK_MKDIR ?
                 "Folder create cancelled" :
-                "Rename cancelled");
+                (oskMode == FM_OSK_RENAME ?
+                    "Rename cancelled" :
+                    "Filter cancelled"));
             USB2XB_AudioPlay(U2X_SOUND_BACK);
         }
 
@@ -1898,8 +3446,54 @@ int FileMan_Update(WORD pressed, WORD held)
 
         st = CopyJob_Pump();
 
+        /*
+            CopyJob intentionally returns to the UI for one frame after the
+            expand-once pass completes. At this point totalBytes is exact and
+            no destination payload has been written yet, so this is the safe
+            place to reject an oversized transfer.
+        */
+        if (st == CJ_RUNNING &&
+            !CopyJob_Preparing() &&
+            !s_copyPreflightChecked)
+        {
+            ULONGLONG required = CopyJob_TotalBytes();
+            ULONGLONG freeBytes = 0;
+            int freeKnown = 0;
+
+            s_copyPreflightChecked = 1;
+
+            if (copy_destination_space(&freeBytes, &freeKnown) &&
+                freeKnown &&
+                required > freeBytes)
+            {
+                s_copyPreflightNoSpace = 1;
+                CopyJob_Cancel();
+                return 0;
+            }
+        }
+
         if (st == CJ_CONFLICT)
         {
+            /*
+                The launch stage is cleared before copy begins, so a collision
+                can only come from a race/stale cache entry. Overwrite it
+                automatically rather than showing the normal copy conflict UI.
+            */
+            if (s_launchStaging)
+            {
+                if (CopyJob_ResolveConflict(
+                    CJ_CONFLICT_OVERWRITE))
+                {
+                    return 0;
+                }
+
+                s_launchStaging = 0;
+                s_mode = FM_BROWSE;
+                setmsg("Launch staging failed");
+                USB2XB_AudioPlay(U2X_SOUND_ERROR);
+                return 0;
+            }
+
             s_mode = FM_COPY_CONFLICT;
             return 0;
         }
@@ -1907,6 +3501,57 @@ int FileMan_Update(WORD pressed, WORD held)
         if (st != CJ_RUNNING)
         {
             s_mode = FM_BROWSE;
+
+            if (s_launchStaging)
+            {
+                s_launchStaging = 0;
+
+                if (st == CJ_DONE)
+                {
+                    /*
+                        USB launch handoff:
+                          1. app contents are staged in D:\\USB2XB_STAGE,
+                          2. map D: to that folder's native device path,
+                          3. launch D:\\<selected>.xbe.
+                    */
+                    if (!U2x_LaunchSelfStage(
+                        s_launchXbeName))
+                    {
+                        setmsg("Unable to launch staged XBE");
+                        USB2XB_AudioPlay(U2X_SOUND_ERROR);
+                    }
+                }
+                else if (st == CJ_CANCELLED)
+                {
+                    if (s_copyPreflightNoSpace)
+                    {
+                        setmsg("Not enough free space");
+                        USB2XB_AudioPlay(U2X_SOUND_ERROR);
+                    }
+                    else
+                    {
+                        setmsg("Launch cancelled");
+                        USB2XB_AudioPlay(U2X_SOUND_BACK);
+                    }
+                    s_copyPreflightNoSpace = 0;
+                }
+                else
+                {
+                    const char* err = CopyJob_ErrorText();
+
+                    setmsg(
+                        (err && err[0]) ?
+                        err :
+                        "Launch staging failed");
+
+                    USB2XB_AudioPlay(U2X_SOUND_ERROR);
+                }
+
+                loadpane(&s_pane[0]);
+                loadpane(&s_pane[1]);
+
+                return 0;
+            }
 
             if (st == CJ_DONE)
             {
@@ -1929,8 +3574,17 @@ int FileMan_Update(WORD pressed, WORD held)
             }
             else if (st == CJ_CANCELLED)
             {
-                setmsg("Cancelled");
-                USB2XB_AudioPlay(U2X_SOUND_BACK);
+                if (s_copyPreflightNoSpace)
+                {
+                    setmsg("Not enough free space");
+                    USB2XB_AudioPlay(U2X_SOUND_ERROR);
+                }
+                else
+                {
+                    setmsg("Cancelled");
+                    USB2XB_AudioPlay(U2X_SOUND_BACK);
+                }
+                s_copyPreflightNoSpace = 0;
             }
             else
             {
@@ -2006,8 +3660,11 @@ int FileMan_Update(WORD pressed, WORD held)
     if (s_mode == FM_OPS)
     {
         int count = ops_count();
+        int sortRow = (s_active == 0) ? 9 : 6;
+        int sortDir = 0;
+        int stickSortDir = 0;
 
-        nav |= left_stick_nav(0, 0);
+        nav |= left_stick_nav(1, &stickSortDir);
 
         if (nav & BTN_DPAD_UP)
         {
@@ -2036,6 +3693,28 @@ int FileMan_Update(WORD pressed, WORD held)
             s_mode = FM_BROWSE;
             USB2XB_AudioPlay(U2X_SOUND_BACK);
             return 0;
+        }
+
+        if (s_opCursor == sortRow)
+        {
+            if (pressed & BTN_DPAD_LEFT)
+                sortDir = -1;
+            else if (pressed & BTN_DPAD_RIGHT)
+                sortDir = 1;
+            else if (stickSortDir < 0)
+                sortDir = -1;
+            else if (stickSortDir > 0)
+                sortDir = 1;
+
+            if (sortDir)
+            {
+                Pane* sortPane = &s_pane[s_active];
+
+                change_sort_mode(sortPane, sortDir);
+                setmsg(sort_mode_label(sortPane->sortMode));
+                USB2XB_AudioPlay(U2X_SOUND_NAV);
+                return 0;
+            }
         }
 
         if (pressed & BTN_A)
@@ -2101,7 +3780,37 @@ int FileMan_Update(WORD pressed, WORD held)
     if (pressed & BTN_RTRIG)page_move(p, 1);
 
     if (pressed & BTN_A)
+    {
+        if (p->cursor >= 0 &&
+            p->cursor < p->count &&
+            !p->ent[p->cursor].isDir &&
+            !p->ent[p->cursor].isDrive &&
+            TextViewer_CanOpen(p->ent[p->cursor].name))
+        {
+            char viewPath[FM_PATH_MAX];
+
+            entrypath(p, p->cursor, viewPath, sizeof(viewPath));
+
+            if (TextViewer_Open(
+                p->fs,
+                viewPath,
+                p->ent[p->cursor].name))
+            {
+                USB2XB_AudioPlay(U2X_SOUND_CONFIRM);
+            }
+            else
+            {
+                setmsg("Unable to open text file");
+                USB2XB_AudioPlay(U2X_SOUND_ERROR);
+            }
+            return 0;
+        }
+
+        if (launch_selected_xbe(p))
+            return 0;
+
         enter(p);
+    }
 
     if (pressed & BTN_B)
         up(p);
@@ -2217,6 +3926,101 @@ static void fmt_size(DWORD bytes, char* out, int cap)
         u32toa(bytes, a, sizeof(a));
         scpy(out, cap, a); scat(out, cap, " B");
     }
+}
+
+static void u64toa(ULONGLONG v, char* out, int cap)
+{
+    char tmp[32];
+    int n = 0, i = 0;
+
+    if (!out || cap <= 0)
+        return;
+
+    if (v == 0)
+    {
+        out[0] = '0';
+        out[1] = 0;
+        return;
+    }
+
+    while (v && n < (int)sizeof(tmp))
+    {
+        tmp[n++] = (char)('0' + (int)(v % 10));
+        v /= 10;
+    }
+
+    while (n > 0 && i < cap - 1)
+        out[i++] = tmp[--n];
+
+    out[i] = 0;
+}
+
+static void fmt_space_value(ULONGLONG bytes, ULONGLONG unit,
+    char* out, int cap)
+{
+    ULONGLONG whole;
+    ULONGLONG frac;
+    char a[32];
+    char b[8];
+
+    if (!out || cap <= 0 || unit == 0)
+        return;
+
+    whole = bytes / unit;
+    frac = ((bytes % unit) * 10) / unit;
+
+    u64toa(whole, a, sizeof(a));
+    u64toa(frac, b, sizeof(b));
+    scpy(out, cap, a);
+    scat(out, cap, ".");
+    scat(out, cap, b);
+}
+
+static void fmt_space_pair(const Pane* p, char* out, int cap)
+{
+    ULONGLONG unit;
+    const char* suffix;
+    char a[32];
+    char b[32];
+
+    if (!out || cap <= 0)
+        return;
+
+    out[0] = 0;
+
+    if (!p || !p->spaceValid || p->totalBytes == 0)
+        return;
+
+    if (p->totalBytes >= (ULONGLONG)1024 * 1024 * 1024)
+    {
+        unit = (ULONGLONG)1024 * 1024 * 1024;
+        suffix = " GB";
+    }
+    else if (p->totalBytes >= (ULONGLONG)1024 * 1024)
+    {
+        unit = (ULONGLONG)1024 * 1024;
+        suffix = " MB";
+    }
+    else
+    {
+        unit = (ULONGLONG)1024;
+        suffix = " KB";
+    }
+
+    if (p->freeKnown)
+    {
+        fmt_space_value(p->freeBytes, unit, a, sizeof(a));
+        scpy(out, cap, a);
+    }
+    else
+    {
+        scpy(out, cap, "--");
+    }
+
+    fmt_space_value(p->totalBytes, unit, b, sizeof(b));
+    scat(out, cap, "/");
+    scat(out, cap, b);
+    scat(out, cap, suffix);
 }
 
 static int marked_count(Pane* p)
@@ -2532,6 +4336,7 @@ static void draw_pane_flat(
     int i;
     int marks;
     char countText[48];
+    char spaceText[48];
     char num[16];
     DWORD border = active ? ui_accent() : UI_ARGB(255, 65, 52, 82);
     const char* title = idx == 0 ? "USB" : "XBOX";
@@ -2587,15 +4392,32 @@ static void draw_pane_flat(
                 idx == s_pendDest ? ui_accent() : ui_text_dim());
         }
     }
-    else if (active)
+    else
     {
-        draw_text_right_shadow(
-            d,
-            x + w - 14,
-            y + 14,
-            "ACTIVE",
-            FONT_SIZE_SMALL,
-            FONT_RGBA(210, 174, 239, 255));
+        fmt_space_pair(p, spaceText, sizeof(spaceText));
+
+        if (spaceText[0])
+        {
+            draw_text_right_shadow(
+                d,
+                x + w - 14,
+                y + 14,
+                spaceText,
+                FONT_SIZE_SMALL,
+                active ?
+                FONT_RGBA(210, 174, 239, 255) :
+                ui_text_dim());
+        }
+        else if (active)
+        {
+            draw_text_right_shadow(
+                d,
+                x + w - 14,
+                y + 14,
+                "ACTIVE",
+                FONT_SIZE_SMALL,
+                FONT_RGBA(210, 174, 239, 255));
+        }
     }
 
     Font_DrawTextEllipsis(
@@ -2815,6 +4637,82 @@ static void draw_pane_flat(
 }
 
 
+
+static void fmt_hex32(DWORD v, char* out, int cap)
+{
+    static const char kHex[] = "0123456789ABCDEF";
+    char tmp[11];
+    int i;
+
+    if (!out || cap <= 0)
+        return;
+
+    tmp[0] = '0';
+    tmp[1] = 'x';
+    for (i = 0; i < 8; ++i)
+        tmp[2 + i] = kHex[(v >> ((7 - i) * 4)) & 0x0F];
+    tmp[10] = 0;
+
+    scpy(out, cap, tmp);
+}
+
+static void fmt_xbe_region(DWORD region, char* out, int cap)
+{
+    int any = 0;
+
+    if (!out || cap <= 0)
+        return;
+
+    out[0] = 0;
+
+    if (region & 0x00000001UL)
+    {
+        scat(out, cap, "NA");
+        any = 1;
+    }
+    if (region & 0x00000002UL)
+    {
+        if (any) scat(out, cap, "/");
+        scat(out, cap, "JPN");
+        any = 1;
+    }
+    if (region & 0x00000004UL)
+    {
+        if (any) scat(out, cap, "/");
+        scat(out, cap, "ROW");
+        any = 1;
+    }
+    if (region & 0x80000000UL)
+    {
+        if (any) scat(out, cap, "/");
+        scat(out, cap, "MFG");
+        any = 1;
+    }
+
+    if (!any)
+        fmt_hex32(region, out, cap);
+}
+
+static void fmt_disc_version(
+    DWORD disc,
+    DWORD version,
+    char* out,
+    int cap)
+{
+    char a[16];
+    char b[16];
+
+    if (!out || cap <= 0)
+        return;
+
+    u32toa(disc, a, sizeof(a));
+    u32toa(version, b, sizeof(b));
+
+    scpy(out, cap, a);
+    scat(out, cap, " / ");
+    scat(out, cap, b);
+}
+
 static void draw_helper_panel(void)
 {
     IDirect3DDevice8* d = Gfx_Device();
@@ -2825,9 +4723,14 @@ static void draw_helper_panel(void)
     int w;
     int h = 344;
     int valid = 0;
+    int isXbe = 0;
     FmEntry* e = 0;
+    const U2X_XBE_INFO* xi = 0;
     char path[FM_PATH_MAX];
     char sizeText[32];
+    char valueText[64];
+
+    path[0] = 0;
 
     if (!s_helperOpen)
         return;
@@ -2847,6 +4750,21 @@ static void draw_helper_panel(void)
             UI_ARGB(126, 0, 0, 0));
     }
 
+    if (p &&
+        p->cursor >= 0 &&
+        p->cursor < p->count)
+    {
+        e = &p->ent[p->cursor];
+        valid = 1;
+
+        if (!e->isDir && !e->isDrive && is_xbe_name(e->name))
+        {
+            entrypath(p, p->cursor, path, sizeof(path));
+            xi = U2x_XbeInfoFor(p->fs, path);
+            isXbe = xi != 0;
+        }
+    }
+
     UI_FillRect(x + 7, y + 8, w, h, UI_ARGB(78, 0, 0, 0));
     UI_FillRect(x + 4, y + 5, w, h, UI_ARGB(110, 0, 0, 0));
     UI_FillRect(x, y, w, h, UI_ARGB(222, 16, 11, 26));
@@ -2856,7 +4774,8 @@ static void draw_helper_panel(void)
 
     draw_text_shadow(
         d, x + 14, y + 14,
-        s_active == 0 ? "USB DETAILS" : "XBOX DETAILS",
+        isXbe ? "XBE DETAILS" :
+        (s_active == 0 ? "USB DETAILS" : "XBOX DETAILS"),
         FONT_SIZE_MEDIUM,
         FONT_WHITE,
         w - 28);
@@ -2865,21 +4784,16 @@ static void draw_helper_panel(void)
         x + 14, y + 40, w - 28, 1,
         UI_ARGB(80, 194, 80, 255));
 
-    if (p &&
-        p->cursor >= 0 &&
-        p->cursor < p->count)
-    {
-        e = &p->ent[p->cursor];
-        valid = 1;
-    }
-
     if (valid)
     {
-        entrypath(
-            p,
-            p->cursor,
-            path,
-            sizeof(path));
+        if (!path[0])
+        {
+            entrypath(
+                p,
+                p->cursor,
+                path,
+                sizeof(path));
+        }
 
         Font_DrawText(
             d, x + 14, y + 52,
@@ -2937,61 +4851,256 @@ static void draw_helper_panel(void)
             }
         }
 
-        Font_DrawText(
-            d, x + 14, y + 106,
-            "TYPE",
-            FONT_SIZE_SMALL,
-            FONT_RGBA(174, 139, 207, 255),
-            w - 28);
-
-        draw_text_shadow(
-            d, x + 14, y + 126,
-            e->isDrive ? "DRIVE" :
-            e->isDir ? "FOLDER" : "FILE",
-            FONT_SIZE_SMALL,
-            FONT_WHITE,
-            w - 28);
-
-        if (!e->isDir && !e->isDrive)
+        if (isXbe)
         {
+            /* XBE-specific view: compact rows leave the helper controls intact. */
+            Font_DrawText(
+                d, x + 14, y + 102,
+                "TITLE",
+                FONT_SIZE_SMALL,
+                FONT_RGBA(174, 139, 207, 255),
+                w - 28);
+
+            Font_DrawTextEllipsis(
+                d, x + 14, y + 120,
+                xi->title[0] ? xi->title : "(NO TITLE)",
+                FONT_SIZE_SMALL,
+                FONT_WHITE,
+                w - 28);
+
+            Font_DrawText(
+                d, x + 14, y + 148,
+                "TITLE ID",
+                FONT_SIZE_SMALL,
+                FONT_RGBA(174, 139, 207, 255),
+                70);
+            fmt_hex32(xi->titleId, valueText, sizeof(valueText));
+            Font_DrawTextRight(
+                d, x + w - 14, y + 148,
+                valueText,
+                FONT_SIZE_SMALL,
+                FONT_WHITE);
+
+            Font_DrawText(
+                d, x + 14, y + 168,
+                "REGION",
+                FONT_SIZE_SMALL,
+                FONT_RGBA(174, 139, 207, 255),
+                64);
+            fmt_xbe_region(xi->region, valueText, sizeof(valueText));
+            {
+                int regionX = x + 76;
+                int regionW = (x + w - 14) - regionX;
+                const char* regionText = valueText;
+
+                if (Font_MeasureText(
+                    valueText,
+                    FONT_SIZE_SMALL) > regionW)
+                {
+                    /*
+                        Use the same selected-entry marquee clock as the name.
+                        Keeping the same cursor key avoids two marquee states
+                        fighting each other every frame.
+                    */
+                    regionText = marquee_name(
+                        p,
+                        p->cursor,
+                        valueText,
+                        FONT_SIZE_SMALL,
+                        regionW);
+
+                    Font_DrawText(
+                        d, regionX + 1, y + 169,
+                        regionText,
+                        FONT_SIZE_SMALL,
+                        FONT_RGBA(0, 0, 0, 180),
+                        regionW);
+
+                    Font_DrawText(
+                        d, regionX, y + 168,
+                        regionText,
+                        FONT_SIZE_SMALL,
+                        FONT_WHITE,
+                        regionW);
+                }
+                else
+                {
+                    Font_DrawTextRight(
+                        d, x + w - 14, y + 168,
+                        regionText,
+                        FONT_SIZE_SMALL,
+                        FONT_WHITE);
+                }
+            }
+
+            Font_DrawText(
+                d, x + 14, y + 188,
+                "INIT",
+                FONT_SIZE_SMALL,
+                FONT_RGBA(174, 139, 207, 255),
+                64);
+            fmt_hex32(xi->initFlags, valueText, sizeof(valueText));
+            Font_DrawTextRight(
+                d, x + w - 14, y + 188,
+                valueText,
+                FONT_SIZE_SMALL,
+                FONT_WHITE);
+
+            Font_DrawText(
+                d, x + 14, y + 208,
+                "DISC / VER",
+                FONT_SIZE_SMALL,
+                FONT_RGBA(174, 139, 207, 255),
+                82);
+            fmt_disc_version(
+                xi->discNumber,
+                xi->version,
+                valueText,
+                sizeof(valueText));
+            {
+                int versionX = x + 104;
+                int versionW = (x + w - 14) - versionX;
+                const char* versionText = valueText;
+
+                if (Font_MeasureText(
+                    valueText,
+                    FONT_SIZE_SMALL) > versionW)
+                {
+                    versionText = marquee_name(
+                        p,
+                        p->cursor,
+                        valueText,
+                        FONT_SIZE_SMALL,
+                        versionW);
+
+                    Font_DrawText(
+                        d, versionX + 1, y + 209,
+                        versionText,
+                        FONT_SIZE_SMALL,
+                        FONT_RGBA(0, 0, 0, 180),
+                        versionW);
+
+                    Font_DrawText(
+                        d, versionX, y + 208,
+                        versionText,
+                        FONT_SIZE_SMALL,
+                        FONT_WHITE,
+                        versionW);
+                }
+                else
+                {
+                    Font_DrawTextRight(
+                        d, x + w - 14, y + 208,
+                        versionText,
+                        FONT_SIZE_SMALL,
+                        FONT_WHITE);
+                }
+            }
+
             fmt_size(
                 e->sizeLo,
                 sizeText,
                 sizeof(sizeText));
 
             Font_DrawText(
-                d, x + 14, y + 158,
+                d, x + 14, y + 228,
                 "SIZE",
+                FONT_SIZE_SMALL,
+                FONT_RGBA(174, 139, 207, 255),
+                64);
+            Font_DrawTextRight(
+                d, x + w - 14, y + 228,
+                sizeText,
+                FONT_SIZE_SMALL,
+                FONT_WHITE);
+        }
+        else
+        {
+            Font_DrawText(
+                d, x + 14, y + 106,
+                "TYPE",
                 FONT_SIZE_SMALL,
                 FONT_RGBA(174, 139, 207, 255),
                 w - 28);
 
             draw_text_shadow(
-                d, x + 14, y + 178,
-                sizeText,
+                d, x + 14, y + 126,
+                e->isDrive ? "DRIVE" :
+                e->isDir ? "FOLDER" : "FILE",
                 FONT_SIZE_SMALL,
                 FONT_WHITE,
                 w - 28);
+
+            if (!e->isDir && !e->isDrive)
+            {
+                fmt_size(
+                    e->sizeLo,
+                    sizeText,
+                    sizeof(sizeText));
+
+                Font_DrawText(
+                    d, x + 14, y + 158,
+                    "SIZE",
+                    FONT_SIZE_SMALL,
+                    FONT_RGBA(174, 139, 207, 255),
+                    w - 28);
+
+                draw_text_shadow(
+                    d, x + 14, y + 178,
+                    sizeText,
+                    FONT_SIZE_SMALL,
+                    FONT_WHITE,
+                    w - 28);
+            }
+
+            Font_DrawText(
+                d, x + 14, y + 212,
+                "PATH",
+                FONT_SIZE_SMALL,
+                FONT_RGBA(174, 139, 207, 255),
+                w - 28);
+
+            {
+                int pathW = w - 28;
+                const char* pathText = path;
+
+                if (Font_MeasureText(
+                    path,
+                    FONT_SIZE_SMALL) > pathW)
+                {
+                    pathText = marquee_name(
+                        p,
+                        p->cursor,
+                        path,
+                        FONT_SIZE_SMALL,
+                        pathW);
+
+                    Font_DrawText(
+                        d, x + 15, y + 233,
+                        pathText,
+                        FONT_SIZE_SMALL,
+                        FONT_RGBA(0, 0, 0, 180),
+                        pathW);
+
+                    Font_DrawText(
+                        d, x + 14, y + 232,
+                        pathText,
+                        FONT_SIZE_SMALL,
+                        ui_text_dim(),
+                        pathW);
+                }
+                else
+                {
+                    Font_DrawTextEllipsis(
+                        d, x + 14, y + 232,
+                        pathText,
+                        FONT_SIZE_SMALL,
+                        ui_text_dim(),
+                        pathW);
+                }
+            }
         }
-
-        Font_DrawText(
-            d, x + 14, y + 212,
-            "PATH",
-            FONT_SIZE_SMALL,
-            FONT_RGBA(174, 139, 207, 255),
-            w - 28);
-
-        Font_DrawTextEllipsis(
-            d, x + 14, y + 232,
-            path,
-            FONT_SIZE_SMALL,
-            ui_text_dim(),
-            w - 28);
     }
-
-    UI_FillRect(
-        x + 12, y + h - 104, w - 24, 1,
-        UI_ARGB(255, 52, 42, 67));
 
     Font_DrawText(
         d, x + 14, y + h - 89,
@@ -3125,9 +5234,11 @@ static void draw_ops_overlay(void)
     int vw = logical_width();
     int w = UI_IsWide() ? 420 : 360;
     int count = ops_count();
-    int h = 98 + count * 36;
+    int sortRow = (s_active == 0) ? 9 : 6;
+    int rowH = count > 9 ? 28 : (count > 8 ? 32 : 36);
+    int h = 98 + count * rowH;
     int x = (vw - w) / 2;
-    int y = 84;
+    int y = count > 9 ? 66 : 84;
     int i;
 
     UI_FillRect(
@@ -3163,7 +5274,7 @@ static void draw_ops_overlay(void)
 
     for (i = 0; i < count; ++i)
     {
-        int ry = y + 86 + i * 36;
+        int ry = y + 86 + i * rowH;
 
         if (i == s_opCursor)
         {
@@ -3209,6 +5320,19 @@ static void draw_ops_overlay(void)
             i == s_opCursor ?
             FONT_WHITE :
             FONT_RGBA(208, 194, 222, 255));
+
+        if (i == sortRow)
+        {
+            Font_DrawTextRight(
+                d,
+                (float)(x + w - 34),
+                (float)(ry + 2),
+                "<  >",
+                FONT_SIZE_SMALL,
+                i == s_opCursor ?
+                FONT_RGBA(250, 226, 122, 255) :
+                FONT_RGBA(150, 132, 166, 255));
+        }
     }
 
     iso_panel_end();
@@ -3431,7 +5555,7 @@ static void draw_footer(void)
     else if (s_mode == FM_COPY_CONFLICT)
         help = "A OVERWRITE    X SKIP    B CANCEL";
     else
-        help = "A OPEN    B UP    X ACTIONS    BACK EXIT";
+        help = "A OPEN / LAUNCH    B UP    X ACTIONS    BACK EXIT";
 
     if (s_msg[0])
     {
@@ -3466,6 +5590,24 @@ void FileMan_Render(void)
     IDirect3DDevice8* d = Gfx_Device();
 
     draw_backdrop();
+
+    if (TextViewer_IsActive())
+    {
+        TextViewer_Render();
+        return;
+    }
+
+    if (HexViewer_IsActive())
+    {
+        HexViewer_Render();
+        return;
+    }
+
+    if (ChecksumViewer_IsActive())
+    {
+        ChecksumViewer_Render();
+        return;
+    }
 
     draw_pane_flat(
         &s_pane[0],
@@ -3617,7 +5759,11 @@ void FileMan_Render(void)
                 &done, &total);
 
             draw_progress_box(
-                s_copyMove ? "PREPARING MOVE" : "PREPARING COPY",
+                s_launchStaging ?
+                "PREPARING USB APP" :
+                (s_copyMove ? "PREPARING MOVE" : "PREPARING COPY"),
+                s_launchStaging ?
+                "Building launch file list..." :
                 "Building file list...",
                 0, 0, 1,
                 fs, -1);
@@ -3634,7 +5780,9 @@ void FileMan_Render(void)
                 &fileTotal);
 
             draw_progress_box(
-                s_copyMove ? "MOVING DATA" : "COPYING DATA",
+                s_launchStaging ?
+                "LOADING USB APP" :
+                (s_copyMove ? "MOVING DATA" : "COPYING DATA"),
                 name,
                 done, total, 1,
                 fileCurrent, fileTotal);
@@ -3642,7 +5790,8 @@ void FileMan_Render(void)
     }
 
     if (s_mode == FM_OSK_MKDIR ||
-        s_mode == FM_OSK_RENAME)
+        s_mode == FM_OSK_RENAME ||
+        s_mode == FM_OSK_FILTER)
     {
         Osk_Draw(d);
     }

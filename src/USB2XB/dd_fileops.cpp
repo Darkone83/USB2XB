@@ -81,13 +81,23 @@ static void join_pattern(char* out, int cap, const char* path)
 static void fill_entry(DDDirEntry* e, const WIN32_FIND_DATA* fd)
 {
     int i = 0;
+
     while (fd->cFileName[i] && i < DD_NAME_MAX - 1) {
         e->name[i] = fd->cFileName[i];
         ++i;
     }
+
     e->name[i] = 0;
     e->sizeLo = fd->nFileSizeLow;
     e->isDir = (fd->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
+
+    /*
+        Keep the native FATX/Win32 last-write value intact. FILETIME compares
+        chronologically as an unsigned 64-bit value, which is all FileMan needs.
+    */
+    e->sortTime =
+        ((ULONGLONG)fd->ftLastWriteTime.dwHighDateTime << 32) |
+        (ULONGLONG)fd->ftLastWriteTime.dwLowDateTime;
 }
 
 static int fatx_list_begin(DDStorage* s, const char* path,

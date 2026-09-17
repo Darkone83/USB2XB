@@ -10,9 +10,9 @@
 
 USB2XB is a dual-pane file manager for the Original Xbox designed to move files directly between the Xbox and standard **FAT32 USB mass-storage devices** connected through a controller-port USB adapter.
 
-It is intended to make simple USB ↔ Xbox file transfers possible without FTP, a network connection, or a PC-side Xbox filesystem tool.
+It is intended to make USB ↔ Xbox file management possible without FTP, a network connection, or a PC-side Xbox filesystem tool.
 
-> **Release Candidate:** USB2XB is still RC software. Keep backups of anything important, especially while testing a new USB device.
+> **Release Candidate 2:** USB2XB is still RC software. Keep backups of anything important, especially while testing a new USB device.
 
 ## Features
 
@@ -24,6 +24,15 @@ It is intended to make simple USB ↔ Xbox file transfers possible without FTP, 
 - Delete files and folders
 - FAT32 USB formatting
 - USB hotplug after the initial session scan
+- Free / total storage display
+- Destination free-space preflight before copy begins
+- Sort by **Name, Size, or Date**
+- Current-directory filename filtering
+- XBE metadata display
+- Launch XBEs from FATX or USB
+- Read-only text viewer
+- Read-only hex viewer
+- CRC32 and MD5 checksums
 - Multi-sector FAT32 transfers optimized for the Original Xbox USB controller
 - USB Mass Storage / BOT recovery for transport errors
 - Controller-friendly interface with copy progress and conflict handling
@@ -75,7 +84,7 @@ Once USB2XB reports that the FAT32 device is ready, the USB pane can be used nor
 
 ### Format USB
 
-USB2XB includes a **Format USB** option in the USB operations menu.
+USB2XB includes a **Format USB** option in the USB Actions menu.
 
 This reformats the currently recognized FAT32 volume and **erases its contents**. It is not a full partitioning tool, so a drive that does not already have a usable partition layout should be prepared on a PC first.
 
@@ -92,13 +101,13 @@ When USB2XB first launches:
 
 That first scan enables USB handling for the rest of the session.
 
-After the initial scan, physical hotplug is automatic:
+After the initial scan, physical hotplug is automatic while USB2XB is idle:
 
-- Remove the USB drive while USB2XB is idle
+- Remove the USB drive
 - Insert it again
 - USB2XB will detect and remount it automatically
 
-If needed, **Rescan USB** is available from the USB operations menu.
+If needed, **Rescan USB** is available from the USB Actions menu.
 
 > **Do not remove the USB drive while a copy, move, format, or other write operation is in progress.**
 
@@ -106,19 +115,29 @@ If needed, **Rescan USB** is available from the USB operations menu.
 
 | Control | Action |
 | --- | --- |
-| D-Pad Up / Down | Move through the current file list |
-| Left Stick Up / Down | Move through the current file list |
-| D-Pad Left / Right | Switch between USB and Xbox panes |
-| Left Stick Left / Right | Switch between USB and Xbox panes |
+| D-Pad Up / Down | Move through the current file list or menu |
+| Left Stick Up / Down | Move through the current file list or menu |
+| D-Pad Left / Right | Switch panes; while **Sort** is highlighted, change sort mode |
+| Left Stick Left / Right | Switch panes; while **Sort** is highlighted, change sort mode |
 | LT / RT | Page up / page down |
-| A | Open folder / confirm |
-| B | Go up one folder |
+| A | Open folder, open supported text file, launch XBE, or confirm |
+| B | Go up one folder / back |
 | Y | Select / unselect item |
 | White | Copy / paste staged copy or move |
 | Black | Stage a move |
-| X | Open operations menu |
-| START | First USB scan; afterward show/hide pane details |
+| X | Open Actions menu |
+| START | First USB scan; afterward show / hide pane details |
 | BACK | Cancel the current operation or open the exit confirmation |
+
+### Viewer Controls
+
+The text, hex, and checksum utilities are read-only.
+
+| Control | Action |
+| --- | --- |
+| D-Pad Up / Down | Scroll one line / row |
+| LT / RT | Page up / page down |
+| B / BACK | Exit viewer or cancel an active checksum |
 
 ## Copying Files
 
@@ -148,6 +167,16 @@ While choosing a destination:
 - **WHITE** starts the transfer
 - **BACK** cancels the staged operation
 
+### Free-Space Preflight
+
+During copy preparation, USB2XB expands the selected files and folders once, counts the files, and totals the source file bytes.
+
+Before payload transfer begins, USB2XB checks the destination free space when that information is available.
+
+If the required file bytes exceed the known free space, the copy is stopped before the first payload file is written.
+
+For FAT32 devices whose FSInfo free-space count is unavailable, USB2XB reports the total capacity but does not invent a free-space value or incorrectly block the copy.
+
 ## File Conflicts
 
 If a file already exists at the destination:
@@ -158,24 +187,156 @@ If a file already exists at the destination:
 | X | Skip |
 | B / BACK | Cancel |
 
-## Operations Menu
+## Actions Menu
 
-Press **X** to open the operations menu.
+Press **X** to open the Actions menu.
 
 ### USB Pane
 
 - New Folder
 - Rename
 - Delete
+- Hex Viewer
+- Checksums
+- Filter
 - Rescan USB
 - Mount / Unmount USB
 - Format USB
+- Sort: Name / Size / Date
 
 ### Xbox Pane
 
 - New Folder
 - Rename
 - Delete
+- Hex Viewer
+- Checksums
+- Filter
+- Sort: Name / Size / Date
+
+### Sorting
+
+Highlight the **Sort** row and use **Left / Right** to change the value.
+
+Available modes:
+
+- **Name** — alphabetical
+- **Size** — largest files first
+- **Date** — newest first
+
+Directories remain grouped above files. Selection is preserved where possible when the sort order changes.
+
+Pressing **A** on the Sort row does not change the sort mode; USB2XB will remind you to use **Left / Right**.
+
+### Filtering
+
+Choose **Filter** to open the on-screen keyboard.
+
+- Matching is case-insensitive
+- Matching is substring-based
+- Files and folders both participate
+- The current sort mode is applied after filtering
+- Submitting an empty filter clears it
+- Changing directories clears the active filter
+- The menu displays **Filter: Active** while a filter is in use
+
+Filtering is limited to the current directory; it is not a recursive search.
+
+## Pane Details
+
+After the first USB scan, press **START** to show or hide pane details.
+
+The details view can show information such as:
+
+- Selected filename
+- File / folder type
+- File size
+- Storage free / total capacity
+- XBE metadata when an XBE is highlighted
+
+Long metadata values use marquee scrolling where needed.
+
+## XBE Support
+
+### XBE Metadata
+
+When an XBE is highlighted with pane details visible, USB2XB can display:
+
+- XBE title
+- Title ID
+- Region
+- InitFlags
+- Disc / version
+- File size
+
+Long Region and version values use marquee scrolling when they exceed the available width.
+
+### Launching from Xbox Storage
+
+Highlight an XBE on FATX and press **A**.
+
+USB2XB remaps `D:` to the XBE's containing directory before launching so applications that expect their own files relative to `D:` can start normally.
+
+### Launching from USB
+
+Highlight an XBE on USB and press **A**.
+
+Because an Xbox application cannot execute directly from FAT32 USB storage, USB2XB stages the selected application's containing directory into its private Xbox-side staging area, then launches the staged XBE.
+
+This allows applications that rely on additional files beside the XBE to launch with their supporting content.
+
+## Text Viewer
+
+Press **A** on a supported text file to open the read-only text viewer.
+
+Supported extensions:
+
+- `.txt`
+- `.csv`
+- `.cfg`
+- `.ini`
+- `.log`
+- `.ver`
+
+Features:
+
+- Up to 512 KB loaded for viewing
+- 80-character line wrapping
+- D-pad line scrolling
+- LT / RT page scrolling
+- Truncation indication for oversized files
+
+## Hex Viewer
+
+Choose **Hex Viewer** from the Actions menu for any regular file.
+
+The viewer displays:
+
+- 8-digit file offset
+- 16 bytes per row
+- Two 8-byte hexadecimal groups
+- ASCII representation
+
+Features:
+
+- D-pad row scrolling
+- LT / RT page scrolling
+- Up to 1 MB loaded for viewing
+- Truncation indication for larger files
+- Read-only operation
+
+## Checksums
+
+Choose **Checksums** from the Actions menu for any regular file.
+
+USB2XB calculates:
+
+- **CRC32**
+- **MD5**
+
+Both hashes are calculated in one streaming pass through the storage abstraction.
+
+Checksum processing is incremental so the UI remains responsive during large files, and **B / BACK** can cancel the operation.
 
 ## Transfer Speeds
 
@@ -187,7 +348,7 @@ USB2XB is optimized to reduce unnecessary transfer overhead, but it cannot turn 
 
 A USB 2.0 or USB 3.x flash drive will still operate at the speed supported by the Xbox.
 
-In other words: **USB2XB is intended for convenient local file transfer, not high-speed storage.**
+In other words: **USB2XB is intended for convenient local file transfer and service work, not high-speed storage.**
 
 ## Filesystem Notes
 
@@ -201,6 +362,27 @@ In other words: **USB2XB is intended for convenient local file transfer, not hig
 ### Xbox
 
 USB2XB accesses the Xbox filesystem normally through the console and can browse available Xbox storage volumes from the Xbox pane.
+
+FATX filenames are subject to the Xbox filesystem's naming restrictions, including the 42-byte filename limit.
+
+## Current RC2 Notes
+
+USB2XB RC2 is intended to be feature-complete enough for release-candidate testing rather than continued major feature expansion.
+
+Current areas worth testing heavily include:
+
+- Repeated USB remove / reinsert cycles while idle
+- Large USB ↔ FATX transfers
+- Large directory trees
+- Nearly-full destination volumes
+- Long filenames and deep directory paths
+- Sort / filter interactions
+- Viewer and checksum exit / cancel behavior
+- 64 MB retail Xbox memory usage during extended sessions
+
+The browser currently keeps a bounded in-memory directory listing, so exceptionally large directories may not display every entry at once.
+
+Free-space preflight compares logical source file bytes. Very large collections of tiny files can consume additional physical space because of filesystem cluster allocation and directory metadata.
 
 ## Troubleshooting
 
@@ -240,4 +422,4 @@ Before using a new USB drive:
 - Do not disconnect it during writes
 - Do not power off the Xbox during a format or active transfer
 
-Once a USB device has proven stable with your Xbox, adapter, and USB2XB, it should provide a convenient way to move files without relying on a network connection.
+Once a USB device has proven stable with your Xbox, adapter, and USB2XB, it should provide a convenient way to move and inspect files without relying on a network connection.

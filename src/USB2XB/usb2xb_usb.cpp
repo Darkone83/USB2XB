@@ -7,10 +7,13 @@
       - keep the proven Camera/X-View manual enumeration path
       - do NOT register a USB mass-storage class driver
       - do NOT splice the manually-owned node into the Xbox hub tree
-      - poll the known TI-hub port while mounted
+      - support both Original Xbox USB topologies:
+          * v1.0 TI downstream hub
+          * later MCPX OHCI root-hub ports
+      - poll the active physical port while mounted
       - on physical removal, close the owned endpoints at passive level
       - return the USB address with USBD_FreeUsbAddress(), then recycle the node
-      - poll the TI hub while offline and enumerate the next insertion
+      - poll the available port providers while offline and enumerate the next insertion
 
     Important:
       - cleanup ordering follows the Xbox USBD source: endpoints first,
@@ -45,7 +48,7 @@
 
     The FF/00/00 declaration remains only to reserve the resources required by
     the proven manual path.  The manually-owned MSC node is intentionally kept
-    private; physical removal is detected by polling the known TI-hub port.
+    private; physical removal is detected by polling the active physical port.
 ===========================================================================*/
 
 DECLARE_XPP_TYPE(XViewType)
@@ -109,6 +112,18 @@ extern "C" VOID XViewRemoveDevice(IUsbDevice* Device)
 #define U2X_C_PORT_RESET       20
 #define U2X_PORT_STAT_POWER    0x0100
 
+/* Xbox USBD / OHCI topology facts used only by this translation unit. */
+#define U2X_UDN_ROOT_HUB       0x00
+#define U2X_UDN_HUB            0x01
+#define U2X_MAX_ROOT_HUBS      4
+#define U2X_USBD_HCD_OFF       0x18
+#define U2X_OHCI_RHDA_OFF      0x48
+#define U2X_OHCI_RHPS_OFF      0x54
+#define U2X_OHCI_RH_CCS        0x00000001u
+#define U2X_OHCI_RH_PES        0x00000002u
+#define U2X_OHCI_RH_PRS        0x00000010u
+#define U2X_OHCI_RH_PRSC       0x00100000u
+
 /* SubmitRequest routes 0x82 to OpenDefaultEndpoint on the owned node. */
 #define U2X_URB_OPEN_DEFAULT_EP  0x82
 #define U2X_URB_CLOSE_DEFAULT_EP 0xC3
@@ -160,8 +175,18 @@ extern "C" BOOLEAN __stdcall MmIsAddressValid(PVOID VirtualAddress);
 extern "C" PVOID __stdcall MmAllocateContiguousMemory(ULONG NumberOfBytes);
 extern "C" VOID __stdcall MmFreeContiguousMemory(PVOID BaseAddress);
 
+/*
+    Minimal view of the Xbox USBD host-controller header.  The HCD-private
+    extension begins immediately after AddressList (offset 0x18 on Xbox).
+*/
+struct _USBD_HOST_CONTROLLER
+{
+    ULONG ControllerNumber;
+    IUsbDevice* RootHub;
+    ULONG AddressList[4];
+};
+
 /* Proven Camera/X-View manual-address allocator. */
-struct _USBD_HOST_CONTROLLER;
 unsigned char __fastcall USBD_AllocateUsbAddress(
     struct _USBD_HOST_CONTROLLER* hc);
 void __fastcall USBD_FreeUsbAddress(
@@ -176,6 +201,9 @@ static IUsbDevice* s_hubDev = 0;
 static IUsbDevice* s_ownedDev = 0;
 static int s_hubPort = -1;
 static int s_hubNports = 0;
+static int s_hubIsRoot = 0;
+static IUsbDevice* s_rootHubs[U2X_MAX_ROOT_HUBS];
+static int s_rootHubCount = 0;
 static unsigned char s_portEnabled[9];
 static unsigned char s_portCandidate[9];
 
@@ -504,16 +532,36 @@ static int U2x_NodeIndex(char* base, IUsbDevice* dev)
 
 static void U2x_InspectNode(IUsbDevice* dev)
 {
+    unsigned char* b;
     unsigned char parent;
     int vid;
     int pid;
+    int i;
 
-    if (!dev || s_hubDev)
+    if (!dev)
         return;
 
-    parent = ((const unsigned char*)(const void*)dev)[1];
+    b = (unsigned char*)(void*)dev;
+    parent = b[1];
 
-    if (parent == U2X_IDX_NONE)
+    if (b[0] == U2X_UDN_ROOT_HUB && parent == U2X_IDX_NONE)
+    {
+        for (i = 0; i < s_rootHubCount; ++i)
+        {
+            if (s_rootHubs[i] == dev)
+                return;
+        }
+
+        if (s_rootHubCount < U2X_MAX_ROOT_HUBS)
+            s_rootHubs[s_rootHubCount++] = dev;
+
+        return;
+    }
+
+    if (s_hubDev)
+        return;
+
+    if (parent == U2X_IDX_NONE || b[0] != U2X_UDN_HUB)
         return;
 
     vid = -1;
@@ -522,10 +570,10 @@ static void U2x_InspectNode(IUsbDevice* dev)
     if (!U2x_GetVidPid(dev, &vid, &pid))
         return;
 
-    if (vid == U2X_TI_HUB_VID &&
-        pid == U2X_TI_HUB_PID)
+    if (vid == U2X_TI_HUB_VID && pid == U2X_TI_HUB_PID)
     {
         s_hubDev = dev;
+        s_hubIsRoot = 0;
     }
 }
 
@@ -561,9 +609,7 @@ static void U2x_WalkTree(void)
 
         b = (unsigned char*)(void*)node;
 
-        if (b[1] == U2X_IDX_NONE &&
-            b[2] != U2X_IDX_NONE &&
-            U2x_NodeAt(base, b[2]) != 0)
+        if (b[0] == U2X_UDN_ROOT_HUB && b[1] == U2X_IDX_NONE)
         {
             if (sp < U2X_MAX_NODES)
                 stack[sp++] = node;
@@ -638,6 +684,134 @@ static void U2x_WalkTree(void)
 
 /* ------------------------------------------------------------------------- */
 
+static struct _USBD_HOST_CONTROLLER* U2x_GetHostController(IUsbDevice* dev)
+{
+    unsigned char* b;
+
+    if (!dev || !U2x_Readable(dev, U2X_NODE_SIZE))
+        return 0;
+
+    b = (unsigned char*)(void*)dev;
+    return *(struct _USBD_HOST_CONTROLLER**)(b + 0x0C);
+}
+
+static void* U2x_GetHcdExtension(IUsbDevice* dev)
+{
+    struct _USBD_HOST_CONTROLLER* hc;
+
+    hc = U2x_GetHostController(dev);
+    if (!hc || !U2x_Readable(hc, U2X_USBD_HCD_OFF))
+        return 0;
+
+    return (void*)((unsigned char*)(void*)hc + U2X_USBD_HCD_OFF);
+}
+
+static volatile unsigned char* U2x_GetRootOperationalRegisters(IUsbDevice* root)
+{
+    void* hcd;
+
+    hcd = U2x_GetHcdExtension(root);
+    if (!hcd || !U2x_Readable(hcd, sizeof(void*)))
+        return 0;
+
+    return *(volatile unsigned char**)(void*)hcd;
+}
+
+static int U2x_ReadRootPortStatus(IUsbDevice* root, int port, ULONG* status)
+{
+    volatile unsigned char* regs;
+    ULONG nports;
+
+    if (!root || !status || port < 1)
+        return 0;
+
+    regs = U2x_GetRootOperationalRegisters(root);
+    if (!regs)
+        return 0;
+
+    nports = (*(volatile ULONG*)(regs + U2X_OHCI_RHDA_OFF)) & 0xFFu;
+    if (nports < 1 || nports > 8 || (ULONG)port > nports)
+        return 0;
+
+    *status = *(volatile ULONG*)(regs + U2X_OHCI_RHPS_OFF + ((port - 1) * 4));
+    return 1;
+}
+
+static int U2x_ResetRootPort(IUsbDevice* root, int port)
+{
+    volatile unsigned char* regs;
+    volatile ULONG* portReg;
+    ULONG rhda;
+    ULONG status;
+    ULONG nports;
+    int tries;
+
+    if (!root || port < 1)
+        return 0;
+
+    regs = U2x_GetRootOperationalRegisters(root);
+    if (!regs)
+        return 0;
+
+    rhda = *(volatile ULONG*)(regs + U2X_OHCI_RHDA_OFF);
+    nports = rhda & 0xFFu;
+    if (nports < 1 || nports > 8 || (ULONG)port > nports)
+        return 0;
+
+    portReg = (volatile ULONG*)(
+        regs + U2X_OHCI_RHPS_OFF + ((port - 1) * 4));
+
+    status = *portReg;
+    if (!(status & U2X_OHCI_RH_CCS))
+        return 0;
+
+    /*
+        The Xbox HCD root hub is not a transfer-capable USB hub.  Do the
+        same OHCI root-port operation locally rather than depending on the
+        non-exported HCD_ResetRootHubPort() helper from RXDK/libxapi.
+
+        OHCI root-hub port-status registers use write-one commands:
+          bit 4  -> SetPortReset
+          bit 20 -> clear PortResetStatusChange
+
+        Poll live CCS/PRS/PES state rather than the HCD callback.  This keeps
+        USB2XB independent of the private HCD reset-completion bookkeeping.
+    */
+    *portReg = U2X_OHCI_RH_PRS;
+
+    for (tries = 0; tries < 40; ++tries)
+    {
+        Sleep(5);
+        status = *portReg;
+
+        if (!(status & U2X_OHCI_RH_CCS))
+            return 0;
+
+        if (!(status & U2X_OHCI_RH_PRS) &&
+            (status & U2X_OHCI_RH_PES))
+        {
+            /* Acknowledge the reset-complete change latch if still set. */
+            if (status & U2X_OHCI_RH_PRSC)
+                *portReg = U2X_OHCI_RH_PRSC;
+
+            /* USB reset recovery interval before address-zero traffic. */
+            Sleep(10);
+
+            status = *portReg;
+            return ((status & U2X_OHCI_RH_CCS) &&
+                (status & U2X_OHCI_RH_PES) &&
+                !(status & U2X_OHCI_RH_PRS)) ? 1 : 0;
+        }
+    }
+
+    /* Best-effort latch cleanup on timeout; the live state remains decisive. */
+    status = *portReg;
+    if (status & U2X_OHCI_RH_PRSC)
+        *portReg = U2X_OHCI_RH_PRSC;
+
+    return 0;
+}
+
 static int U2x_ReadHubDescriptor(IUsbDevice* hub)
 {
     unsigned char hd[16];
@@ -647,6 +821,30 @@ static int U2x_ReadHubDescriptor(IUsbDevice* hub)
 
     if (!hub)
         return 0;
+
+    if (s_hubIsRoot)
+    {
+        volatile unsigned char* regs;
+        ULONG rhda;
+
+        regs = U2x_GetRootOperationalRegisters(hub);
+        if (!regs)
+            return 0;
+
+        rhda = *(volatile ULONG*)(regs + U2X_OHCI_RHDA_OFF);
+        nports = (int)(rhda & 0xFFu);
+        if (nports < 1 || nports > 8)
+            return 0;
+
+        s_hubNports = nports;
+        s_hubPort = -1;
+        for (i = 0; i < 9; ++i)
+        {
+            s_portEnabled[i] = 0;
+            s_portCandidate[i] = 0;
+        }
+        return 1;
+    }
 
     for (i = 0; i < 16; ++i)
         hd[i] = 0;
@@ -692,6 +890,38 @@ static int U2x_ReadHubPort(IUsbDevice* hub, int port)
 
     if (!hub || port<1 || port>s_hubNports)
         return 0;
+
+    if (s_hubIsRoot)
+    {
+        ULONG rootStatus;
+
+        if (!U2x_ReadRootPortStatus(hub, port, &rootStatus))
+            return 0;
+
+        if (!(rootStatus & U2X_OHCI_RH_CCS) || (rootStatus & U2X_OHCI_RH_PRS))
+            return 1;
+
+        if (rootStatus & U2X_OHCI_RH_PES)
+        {
+            s_portEnabled[port] = 1;
+            return 1;
+        }
+
+        /* Avoid racing the native Xbox settle/reset/enumeration window. */
+        Sleep(150);
+        if (!U2x_ReadRootPortStatus(hub, port, &rootStatus))
+            return 0;
+
+        if ((rootStatus & U2X_OHCI_RH_CCS) &&
+            !(rootStatus & U2X_OHCI_RH_PES) &&
+            !(rootStatus & U2X_OHCI_RH_PRS))
+        {
+            s_portCandidate[port] = 1;
+            if (s_hubPort < 1)
+                s_hubPort = port;
+        }
+        return 1;
+    }
 
     for (i = 0; i < 4; ++i)
         ps[i] = 0;
@@ -830,6 +1060,9 @@ static int U2x_ResetPort(IUsbDevice* hub, int port)
 
     if (!hub || port < 1)
         return 0;
+
+    if (s_hubIsRoot)
+        return U2x_ResetRootPort(hub, port);
 
     st = U2x_Control(
         hub,
@@ -3358,6 +3591,15 @@ static int U2x_GetHubPortConnected(IUsbDevice* hub, int port, int* connected)
     if (!hub || !connected || port < 1 || port > s_hubNports)
         return 0;
 
+    if (s_hubIsRoot)
+    {
+        ULONG rootStatus;
+        if (!U2x_ReadRootPortStatus(hub, port, &rootStatus))
+            return 0;
+        *connected = (rootStatus & U2X_OHCI_RH_CCS) ? 1 : 0;
+        return 1;
+    }
+
     for (i = 0; i < 4; ++i)
         ps[i] = 0;
 
@@ -3503,9 +3745,71 @@ static int U2x_ReclaimManualDeviceAfterDisconnect(void)
 }
 
 
+static int U2x_FindRootHubCandidate(void)
+{
+    int rh;
+    int port;
+    int readableRoot = 0;
+
+    for (rh = 0; rh < s_rootHubCount; ++rh)
+    {
+        IUsbDevice* root = s_rootHubs[rh];
+        if (!root)
+            continue;
+
+        s_hubDev = root;
+        s_hubIsRoot = 1;
+
+        if (!U2x_ReadHubDescriptor(root))
+            continue;
+
+        readableRoot = 1;
+        for (port = 1; port <= s_hubNports; ++port)
+        {
+            if (!U2x_ReadHubPort(root, port))
+                break;
+        }
+
+        if (port <= s_hubNports)
+            continue;
+
+        if (s_hubPort > 0)
+            return 1;
+    }
+
+    return readableRoot ? 0 : -1;
+}
+
 static void U2x_PollHotplugInsert(void)
 {
     int port;
+
+    if (s_hubIsRoot)
+    {
+        int found = U2x_FindRootHubCandidate();
+
+        if (found < 0)
+        {
+            s_hotplugPolling = 0;
+            s_hubDev = 0;
+            s_scanRequested = 1;
+            s_notBeforeTick = GetTickCount() + 250;
+            return;
+        }
+
+        if (!found)
+        {
+            s_state = U2X_USB_OFFLINE;
+            U2x_SetStatus("No USB device");
+            s_nextHotplugPoll = GetTickCount() + 500;
+            return;
+        }
+
+        s_hotplugPolling = 0;
+        U2x_SetStatus("USB detected");
+        U2x_RunStep8();
+        return;
+    }
 
     if (!s_hubDev)
     {
@@ -3552,12 +3856,18 @@ static void U2x_PollHotplugInsert(void)
 static void U2x_RunDiscovery(void)
 {
     int port;
+    int rh;
 
     s_transportUsbdOwned = 0;
     s_hubDev = 0;
     s_ownedDev = 0;
     s_hubPort = -1;
     s_hubNports = 0;
+    s_hubIsRoot = 0;
+    s_rootHubCount = 0;
+
+    for (rh = 0; rh < U2X_MAX_ROOT_HUBS; ++rh)
+        s_rootHubs[rh] = 0;
 
     s_sectorSize = 0;
     s_sectorCount = 0;
@@ -3576,32 +3886,48 @@ static void U2x_RunDiscovery(void)
     }
 
     s_state = U2X_USB_SCANNING;
-    U2x_SetStatus("USB: FIND TI HUB");
-
+    U2x_SetStatus("Searching USB ports");
     U2x_WalkTree();
 
-    if (!s_hubDev)
+    if (s_hubDev)
     {
-        s_state = U2X_USB_OFFLINE;
-        U2x_SetStatus("USB hub not found");
-        return;
-    }
+        s_hubIsRoot = 0;
 
-    U2x_SetStatus("USB: READ HUB DESC");
-
-    if (!U2x_ReadHubDescriptor(s_hubDev))
-    {
-        s_state = U2X_USB_ERROR;
-        U2x_SetStatus("USB hub read failed");
-        return;
-    }
-
-    for (port = 1; port <= s_hubNports; ++port)
-    {
-        if (!U2x_ReadHubPort(s_hubDev, port))
+        if (!U2x_ReadHubDescriptor(s_hubDev))
         {
             s_state = U2X_USB_ERROR;
-            U2x_SetPortReadFailStatus(port);
+            U2x_SetStatus("USB hub read failed");
+            return;
+        }
+
+        for (port = 1; port <= s_hubNports; ++port)
+        {
+            if (!U2x_ReadHubPort(s_hubDev, port))
+            {
+                s_state = U2X_USB_ERROR;
+                U2x_SetPortReadFailStatus(port);
+                return;
+            }
+        }
+    }
+    else
+    {
+        int found;
+
+        if (s_rootHubCount < 1)
+        {
+            s_state = U2X_USB_OFFLINE;
+            U2x_SetStatus("USB controller not found");
+            return;
+        }
+
+        s_hubIsRoot = 1;
+        found = U2x_FindRootHubCandidate();
+
+        if (found < 0)
+        {
+            s_state = U2X_USB_ERROR;
+            U2x_SetStatus("USB root hub read failed");
             return;
         }
     }
@@ -3615,14 +3941,11 @@ static void U2x_RunDiscovery(void)
         return;
     }
 
-    /*
-        Candidate found.  Stop idle polling while the proven manual bring-up
-        path owns the port.
-    */
     s_hotplugPolling = 0;
     U2x_SetCandidateStatus(s_hubPort);
     U2x_RunStep8();
 }
+
 
 
 /* ------------------------------------------------------------------------- */
@@ -3638,6 +3961,10 @@ int USB2XB_USB_Init(void)
     s_hubDev = 0;
     s_hubPort = -1;
     s_hubNports = 0;
+    s_hubIsRoot = 0;
+    s_rootHubCount = 0;
+    for (i = 0; i < U2X_MAX_ROOT_HUBS; ++i)
+        s_rootHubs[i] = 0;
     s_epOutHandle = 0;
     s_epInHandle = 0;
     s_toggleOut = 0;
@@ -3689,6 +4016,10 @@ void USB2XB_USB_Shutdown(void)
     s_ownedDev = 0;
     s_hubPort = -1;
     s_hubNports = 0;
+    s_hubIsRoot = 0;
+    s_rootHubCount = 0;
+    for (i = 0; i < U2X_MAX_ROOT_HUBS; ++i)
+        s_rootHubs[i] = 0;
     s_epOutHandle = 0;
     s_epInHandle = 0;
     s_toggleOut = 0;

@@ -14,6 +14,16 @@ void USB2XB_StorageUsbRemount(void);
 int  USB2XB_StorageUsbUserUnmounted(void);
 
 /*
+    Capacity of the mounted FAT32 volume. totalBytes is valid whenever this
+    returns non-zero. freeKnown reports whether FAT32 FSInfo supplied a valid
+    free-cluster count; when it is false, callers must not reject a copy based
+    on freeBytes. No full FAT scan is performed here.
+*/
+int  USB2XB_StorageUsbSpace(ULONGLONG* freeBytes,
+    ULONGLONG* totalBytes,
+    int* freeKnown);
+
+/*
     Quick-format the currently mounted USB partition as FAT32.
     The MBR/partition boundary is preserved. Formatting is incremental so the
     UI remains responsive while large FAT tables are cleared.
